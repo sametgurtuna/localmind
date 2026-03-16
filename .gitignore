@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust
+src-tauri/target/
+
+# Python
+ai_engine/__pycache__/
+ai_engine/*.pyc
+ai_engine/build/
+ai_engine/*.spec
+ai_engine/.venv/
+**/__pycache__/
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Sidecar binaries
+src-tauri/binaries/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# App data
+app-icon.png
