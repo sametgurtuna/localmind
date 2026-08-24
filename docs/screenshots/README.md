@@ -1,18 +1,24 @@
 # Screenshots
 
-Drop the images referenced by the root `README.md` into this folder, using exactly these file names:
+The images referenced by the root `README.md` are hand built SVG mockups of the LocalMind UI. Geometry, spacing, colours and copy were taken from real captures of the running app, so they render as a faithful reproduction of the interface rather than an idealised redesign.
 
-| File | What it should show |
+| File | What it shows |
 |---|---|
-| `hero.png` | The floating search bar open over a desktop, with a mixed result list (files + app + semantic hit). The main "wow" shot. |
-| `instant-search.png` | A file name query returning results across drives, ideally with the result count / timing visible. |
-| `semantic-search.png` | A natural language query such as "jwt auth implementation" returning content matches with snippets and line numbers. |
-| `app-launcher.png` | App results with their native high resolution icons. |
-| `preview-panel.png` | The split preview panel open with a syntax highlighted file and its metadata. |
-| `action-menu.png` | The per result action menu expanded (open, copy path, terminal, run as admin, …). |
-| `calculator.png` | A calculation or currency conversion result, for example `20% of 500` or `120 usd`. |
-| `settings.png` | The settings panel showing indexed folders, exclude patterns, OCR and quantization toggles. |
-| `indexing.png` | The indexing progress indicator while the engine builds the vector index. |
-| `themes.png` | Dark and light theme side by side. |
+| `hero.svg` | Unified result list: applications and files ranked together for one query |
+| `instant-search.svg` | File name search on the Files tab |
+| `semantic-search.svg` | Content tab: semantic matches with snippets and line numbers |
+| `app-launcher.svg` | Apps tab with native application results |
+| `preview-panel.svg` | Split view: result list plus the preview pane and its actions |
+| `action-menu.svg` | The per result action menu (`Ctrl+K`) |
+| `calculator.svg` | Inline calculation plus web search shortcuts |
+| `settings.svg` | Settings panel: shortcut, theme, indexed folders, performance toggles |
+| `indexing.svg` | Indexing progress strip above live results |
+| `themes.svg` | Dark and light themes side by side |
 
-Recommended: PNG, 1600px wide or larger, captured on a clean desktop background.
+They are SVG, so they stay sharp at any width and add only a few KB each to the repository.
+
+## Regenerating or replacing them
+
+To swap in real captures instead, save PNGs under these same names and update the image paths in the root `README.md` from `.svg` to `.png`.
+
+Earlier real captures of the running app are kept in `oldss/` at the repository root for reference.

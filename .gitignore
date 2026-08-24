@@ -51,6 +51,10 @@ Desktop.ini
 # App data
 app-icon.png
 
+# Reference captures of the running app: these contain real local file paths
+# Remove this line if you want to publish them.
+oldss/
+
 # Claude Code
 .claude/
 .claude/settings.local.json

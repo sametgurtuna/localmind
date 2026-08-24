@@ -34,7 +34,7 @@
 
 <br />
 
-<img src="docs/screenshots/hero.png" width="880" alt="LocalMind search bar in action" />
+<img src="docs/screenshots/hero.svg" width="880" alt="LocalMind search bar in action" />
 
 <sub><i>One hotkey. One search bar. Files, content, apps, math, conversions, all ranked together.</i></sub>
 
@@ -98,7 +98,7 @@ The model, the vector database and the file index all live on disk in `~/.localm
 
 ### Instant native file search
 
-<img src="docs/screenshots/instant-search.png" width="880" alt="Instant native file search across all drives" />
+<img src="docs/screenshots/instant-search.svg" width="880" alt="Instant native file search across all drives" />
 
 Start typing and results appear before you finish the word. LocalMind builds an in memory index straight from the NTFS Master File Table, so it never walks directories and never waits on disk. A million files across multiple drives are searched in **well under a second**, and the index covers your whole PC rather than a handful of folders you had to configure in advance.
 
@@ -116,7 +116,7 @@ If LocalMind is running without administrator rights, it transparently falls bac
 
 ### Semantic content search
 
-<img src="docs/screenshots/semantic-search.png" width="880" alt="Semantic search finding content inside documents and code" />
+<img src="docs/screenshots/semantic-search.svg" width="880" alt="Semantic search finding content inside documents and code" />
 
 Ask for what you remember, not for what the file is called. *"that Docker PDF I downloaded"*, *"the React login component"*, *"jwt auth implementation"*. LocalMind encodes your query with `all-MiniLM-L6-v2`, compares it against every text chunk stored in LanceDB, and returns the closest matches with the exact line range, so you land on the relevant paragraph rather than on the top of a 90 page document.
 
@@ -133,7 +133,7 @@ Ask for what you remember, not for what the file is called. *"that Docker PDF I 
 
 ### App launcher with real native icons
 
-<img src="docs/screenshots/app-launcher.png" width="880" alt="App launcher results with native high resolution icons" />
+<img src="docs/screenshots/app-launcher.svg" width="880" alt="App launcher results with native high resolution icons" />
 
 A native Windows scanner discovers Start Menu shortcuts (`.lnk`), UWP applications and system settings panels, then extracts the full resolution 32 bit icons directly from the executables. The result is a launcher that looks native instead of a list of generic gray file icons.
 
@@ -147,7 +147,7 @@ A native Windows scanner discovers Start Menu shortcuts (`.lnk`), UWP applicatio
 
 ### Split preview panel
 
-<img src="docs/screenshots/preview-panel.png" width="880" alt="Split preview panel with syntax highlighted file content" />
+<img src="docs/screenshots/preview-panel.svg" width="880" alt="Split preview panel with syntax highlighted file content" />
 
 Select any result and read it without leaving the search bar. Code and text are syntax highlighted with `highlight.js`, and the panel shows the metadata that actually matters: full path, size, modified date and file type, plus one click actions.
 
@@ -162,7 +162,7 @@ Select any result and read it without leaving the search bar. Code and text are 
 
 ### An action menu on every result
 
-<img src="docs/screenshots/action-menu.png" width="880" alt="Per result action menu" />
+<img src="docs/screenshots/action-menu.svg" width="880" alt="Per result action menu" />
 
 Finding the file is half the job. Every result carries a full action menu you can drive entirely from the keyboard.
 
@@ -184,7 +184,7 @@ Finding the file is half the job. Every result carries a full action menu you ca
 
 ### Calculator, converter and system actions
 
-<img src="docs/screenshots/calculator.png" width="880" alt="Inline calculator and unit conversion results" />
+<img src="docs/screenshots/calculator.svg" width="880" alt="Inline calculator and unit conversion results" />
 
 The search bar is already open, so it may as well do the small things too. Type an expression and get a copyable answer instantly, with no separate calculator app and no browser tab.
 
@@ -207,7 +207,7 @@ Files, semantic matches, apps, calculations, conversions and web shortcuts are p
 
 ### An index that keeps itself current
 
-<img src="docs/screenshots/indexing.png" width="880" alt="Indexing progress" />
+<img src="docs/screenshots/indexing.svg" width="880" alt="Indexing progress" />
 
 A `watchdog` based file system watcher detects created, modified and deleted files in real time and updates the vector index incrementally. Indexing is resumable and skips anything already processed, so you never sit through a full rebuild.
 
@@ -228,9 +228,9 @@ A `watchdog` based file system watcher detects created, modified and deleted fil
 
 ### Configurable, themed and multilingual
 
-<img src="docs/screenshots/settings.png" width="880" alt="Settings panel" />
+<img src="docs/screenshots/settings.svg" width="880" alt="Settings panel" />
 
-<img src="docs/screenshots/themes.png" width="880" alt="Dark and light themes" />
+<img src="docs/screenshots/themes.svg" width="880" alt="Dark and light themes" />
 
 Dark and light themes, English and Turkish out of the box (the i18n layer is ready for more), a rebindable global shortcut, autostart, indexed folder management, exclude patterns, file size limits, an OCR toggle and an embedding quantization toggle, all from one settings panel.
 
