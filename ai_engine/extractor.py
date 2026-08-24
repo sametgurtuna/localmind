@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import threading
+import zipfile
 from pathlib import Path
+
+import settings
 
 logger = logging.getLogger(__name__)
 
@@ -11,9 +17,9 @@ SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".json", ".js", ".ts", ".tsx", ".jsx",
     ".py", ".html", ".css", ".csv", ".xml", ".yaml", ".yml",
     ".toml", ".rs", ".go", ".java", ".c", ".cpp", ".h",
-    ".rb", ".sh", ".bat", ".log", ".env", ".sql", ".r",
-    # Special parsers
-    ".pdf", ".docx", ".xlsx", ".pptx", ".ipynb",
+    ".rb", ".sh", ".bat", ".env", ".sql", ".r",
+    # Special parsers & Documents / Books
+    ".pdf", ".docx", ".xlsx", ".pptx", ".ipynb", ".epub", ".rtf",
     # Images (OCR)
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
 }
@@ -22,18 +28,53 @@ PLAIN_TEXT_EXTENSIONS = {
     ".txt", ".md", ".json", ".js", ".ts", ".tsx", ".jsx",
     ".py", ".html", ".css", ".csv", ".xml", ".yaml", ".yml",
     ".toml", ".rs", ".go", ".java", ".c", ".cpp", ".h",
-    ".rb", ".sh", ".bat", ".log", ".env", ".sql", ".r",
+    ".rb", ".sh", ".bat", ".env", ".sql", ".r", ".rtf",
 }
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 
+# Junk/lock files that should never waste embedding compute during content indexing
+JUNK_FILENAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
+    "poetry.lock", "gemfile.lock", "composer.lock", "tsconfig.tsbuildinfo",
+    ".ds_store", "thumbs.db", "desktop.ini", "vocabulary.txt", "vocab.txt",
+    "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+})
+
+JUNK_SUFFIXES = (
+    ".min.js", ".min.css", ".bundle.js", ".map", ".d.ts",
+    ".pyc", ".pyo", ".pyd", ".orig", ".rej", ".tmp", ".bak",
+    ".swp", ".swo", ".log",
+)
+
+OCR_LANGS = [s for s in os.environ.get("LOCALMIND_OCR_LANGS", "en,tr").split(",") if s]
+MAX_PDF_PAGES = int(os.environ.get("LOCALMIND_MAX_PDF_PAGES", "200"))
+
+
+def ocr_enabled() -> bool:
+    """OCR is opt-in: the models cost ~500MB of RAM and seconds per image."""
+    return bool(settings.get("ocr"))
+
+
+def is_junk_file(path: str | Path) -> bool:
+    """Check if file is a build artifact, lockfile, minified bundle, or junk."""
+    name = os.path.basename(path).lower()
+    if name in JUNK_FILENAMES:
+        return True
+    if any(name.endswith(sfx) for sfx in JUNK_SUFFIXES):
+        return True
+    return False
+
 
 def extract_text(file_path: str, max_size_mb: float = 50) -> str | None:
-    """Extract text content from a file. Returns None if unsupported or error."""
+    """Extract text content from a file with C++ optimized parsers."""
     path = Path(file_path)
+    name = path.name.lower()
     ext = path.suffix.lower()
 
-    if ext not in SUPPORTED_EXTENSIONS:
+    if ext not in SUPPORTED_EXTENSIONS or is_junk_file(name):
+        return None
+    if ext in IMAGE_EXTENSIONS and not ocr_enabled():
         return None
 
     try:
@@ -46,6 +87,8 @@ def extract_text(file_path: str, max_size_mb: float = 50) -> str | None:
             return _read_plain_text(path)
         elif ext == ".pdf":
             return _read_pdf(path)
+        elif ext == ".epub":
+            return _read_epub(path)
         elif ext == ".docx":
             return _read_docx(path)
         elif ext == ".xlsx":
@@ -62,7 +105,7 @@ def extract_text(file_path: str, max_size_mb: float = 50) -> str | None:
 
 
 def _read_plain_text(path: Path) -> str | None:
-    for encoding in ("utf-8", "latin-1", "cp1252"):
+    for encoding in ("utf-8", "latin-1", "cp1252", "utf-16"):
         try:
             text = path.read_text(encoding=encoding)
             return text.strip() if text.strip() else None
@@ -71,31 +114,100 @@ def _read_plain_text(path: Path) -> str | None:
     return None
 
 
-def _read_pdf(path: Path) -> str | None:
-    import pdfplumber
+def _read_epub(path: Path) -> str | None:
+    """Extract readable text from an EPUB ebook using built-in zipfile."""
+    try:
+        texts = []
+        with zipfile.ZipFile(path, "r") as z:
+            for filename in z.namelist():
+                if filename.lower().endswith((".xhtml", ".html", ".htm")):
+                    raw = z.read(filename).decode("utf-8", errors="ignore")
+                    clean = re.sub(r"<[^>]+>", " ", raw)
+                    clean = " ".join(clean.split())
+                    if clean:
+                        texts.append(clean)
+        return "\n\n".join(texts).strip() if texts else None
+    except Exception as e:
+        logger.debug("Failed to read epub %s: %s", path, e)
+        return None
 
-    texts = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                texts.append(text)
 
-    combined = "\n".join(texts).strip()
-    if combined:
-        return combined
+def _read_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> str | None:
+    """Extract PDF text using C++ PyMuPDF (fitz) with sub-millisecond page parsing."""
+    # 1. Ultra-fast PyMuPDF (MuPDF C++ engine)
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(path))
+        texts = []
+        n_pages = min(len(doc), max_pages)
+        for i in range(n_pages):
+            page = doc[i]
+            t = page.get_text()
+            if t and t.strip():
+                texts.append(t.strip())
+        doc.close()
+        combined = "\n\n".join(texts).strip()
+        if combined:
+            return combined
+    except Exception as e:
+        logger.debug("PyMuPDF extraction fallback for %s: %s", path, e)
 
-    # Fallback: try OCR if pdfplumber returned nothing (scanned PDF)
-    return _read_image_ocr(path)
+    # 2. Fallback to pypdfium2 C++ parser
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(path))
+        texts = []
+        n_pages = min(len(pdf), max_pages)
+        for i in range(n_pages):
+            page = pdf[i]
+            textpage = page.get_textpage()
+            text = textpage.get_text_range()
+            if text and text.strip():
+                texts.append(text.strip())
+        pdf.close()
+        combined = "\n\n".join(texts).strip()
+        if combined:
+            return combined
+    except Exception as e:
+        logger.debug("pypdfium2 extraction fallback for %s: %s", path, e)
+
+    # 2. Fallback to pdfplumber if pypdfium2 had an issue
+    try:
+        import pdfplumber
+        texts = []
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                if i >= max_pages:
+                    break
+                try:
+                    text = page.extract_text()
+                    if text:
+                        texts.append(text)
+                finally:
+                    page.flush_cache()
+                    page.get_textmap.cache_clear()
+        combined = "\n".join(texts).strip()
+        if combined:
+            return combined
+    except Exception:
+        pass
+
+    # 3. Fallback: OCR only when explicitly enabled (scanned PDFs)
+    if ocr_enabled():
+        return _read_image_ocr(path)
+    return None
 
 
 def _read_docx(path: Path) -> str | None:
-    from docx import Document
-
-    doc = Document(str(path))
-    texts = [p.text for p in doc.paragraphs if p.text.strip()]
-    combined = "\n".join(texts).strip()
-    return combined if combined else None
+    try:
+        from docx import Document
+        doc = Document(str(path))
+        texts = [p.text for p in doc.paragraphs if p.text.strip()]
+        combined = "\n".join(texts).strip()
+        return combined if combined else None
+    except Exception as e:
+        logger.debug("docx extraction failed for %s: %s", path, e)
+        return None
 
 
 def _read_xlsx(path: Path) -> str | None:
@@ -160,26 +272,62 @@ def _read_ipynb(path: Path) -> str | None:
 
 
 _ocr_available: bool | None = None
+_ocr_reader = None
+_ocr_lock = threading.Lock()
 
 
-def _read_image_ocr(path: Path) -> str | None:
-    global _ocr_available
+def _get_ocr_reader():
+    """Build the easyocr Reader once and reuse it."""
+    global _ocr_available, _ocr_reader
+    if _ocr_reader is not None:
+        return _ocr_reader
     if _ocr_available is False:
         return None
 
-    try:
-        import easyocr
-        _ocr_available = True
+    with _ocr_lock:
+        if _ocr_reader is not None:
+            return _ocr_reader
+        if _ocr_available is False:
+            return None
+        try:
+            import easyocr
+            _ocr_reader = easyocr.Reader(OCR_LANGS, gpu=False, verbose=False)
+            _ocr_available = True
+            logger.info("OCR reader initialized (langs=%s)", OCR_LANGS)
+        except ImportError:
+            _ocr_available = False
+            logger.debug("easyocr not installed, OCR disabled")
+        except Exception as e:
+            _ocr_available = False
+            logger.warning("OCR reader init failed, OCR disabled: %s", e)
+    return _ocr_reader
 
-        reader = easyocr.Reader(["en", "tr"], gpu=False, verbose=False)
-        results = reader.readtext(str(path))
+
+def release_ocr_reader() -> None:
+    """Drop the OCR models from memory."""
+    global _ocr_reader
+    with _ocr_lock:
+        if _ocr_reader is not None:
+            _ocr_reader = None
+            import gc
+            gc.collect()
+            logger.info("OCR reader released")
+
+
+def _read_image_ocr(path: Path) -> str | None:
+    if not ocr_enabled():
+        return None
+
+    reader = _get_ocr_reader()
+    if reader is None:
+        return None
+
+    try:
+        with _ocr_lock:
+            results = reader.readtext(str(path), detail=1, paragraph=False)
         texts = [r[1] for r in results if r[1].strip()]
         combined = " ".join(texts).strip()
         return combined if combined else None
-    except ImportError:
-        _ocr_available = False
-        logger.debug("easyocr not installed, skipping OCR for %s", path)
-        return None
     except Exception as e:
         logger.warning("OCR failed for %s: %s", path, e)
         return None

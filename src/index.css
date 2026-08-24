@@ -41,6 +41,18 @@ body {
   -webkit-user-select: none;
 }
 
+/* Numeric readouts (counters, sizes, ETAs) must not jitter as digits change. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Keyboard users get a visible focus ring; pointer users do not. */
+:focus-visible {
+  outline: 2px solid rgb(59 130 246 / 0.7);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -68,12 +80,26 @@ body {
 }
 
 .animate-slide-fade-in {
-  animation: slide-fade-in 0.2s ease-out both;
+  animation: slide-fade-in 0.18s ease-out both;
+}
+
+/* Respect the OS "reduce motion" setting: the launcher opens on every
+   keystroke, so animation here is the first thing that becomes tiring. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 4px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-track {
@@ -81,12 +107,20 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #a3a3a3;
-  border-radius: 4px;
+  background: rgba(160, 160, 160, 0.4);
+  border-radius: 6px;
 }
 
 .dark ::-webkit-scrollbar-thumb {
-  background: #525252;
+  background: rgba(100, 100, 100, 0.4);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 120, 0.7);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(140, 140, 140, 0.7);
 }
 
 /* Syntax highlighting - minimal theme */

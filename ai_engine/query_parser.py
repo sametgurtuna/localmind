@@ -9,6 +9,7 @@ Supports:
 Natural language (TR/EN):
   "gecen hafta duzenledigim python dosyalari"
   "pdf files about budget"
+  "celia hodent the gamers brain kitabi"
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ _MODIFIED_FILTER = re.compile(r'\bmodified:(\w+)', re.IGNORECASE)
 _SIZE_FILTER = re.compile(r'\bsize:([<>])(\d+(?:\.\d+)?)(b|kb|mb|gb)\b', re.IGNORECASE)
 _FOLDER_FILTER = re.compile(r'\bfolder:(\S+)', re.IGNORECASE)
 
-# Natural language patterns (TR + EN)
+# Natural language type patterns (TR + EN)
 _NL_TYPE_PATTERNS = [
     (re.compile(r'\bpython\s+dosya(?:lar[ıi]?)?\b', re.IGNORECASE), ".py"),
     (re.compile(r'\bpython\s+files?\b', re.IGNORECASE), ".py"),
@@ -60,11 +61,13 @@ _NL_TIME_PATTERNS = [
     (re.compile(r'\bdun\b|\bd[uü]n\b|\byesterday\b', re.IGNORECASE), "yesterday"),
 ]
 
-# Words to strip from the final query text
+# Words to strip from the final query text (Turkish & English filler words, document types)
 _FILLER_WORDS = re.compile(
     r'\b(?:ile\s+ilgili|hakkinda|hakk[ıi]nda|about|related\s+to|'
     r'duzenledigim|d[uü]zenledi[gğ]im|edited|modified|'
-    r'dosyalar[ıi]?|files?|belgeler[ıi]?|documents?)\b',
+    r'dosyalar[ıi]?|dosyas[ıi]|files?|belgeler[ıi]?|belgesi|documents?|'
+    r'kitaplar[ıi]?|kitab[ıi]|kitap|books?|ebooks?|makale|paper|'
+    r'klas[öo]r[üu]?|klasor|folder|d[öo]k[üu]man(?:lar[ıi]?)?)\b',
     re.IGNORECASE,
 )
 
@@ -108,7 +111,9 @@ def parse_query(raw: str) -> ParsedQuery:
 
     for m in _FOLDER_FILTER.finditer(text):
         folder = m.group(1)
-        escaped = folder.replace("\\", "\\\\").replace("'", "\\'")
+        # Only the single quote is special in this SQL dialect; escaping
+        # backslashes here made every Windows path filter miss.
+        escaped = folder.replace("'", "''")
         result.where_clauses.append(f"file_path LIKE '%{escaped}%'")
     text = _FOLDER_FILTER.sub("", text)
 
@@ -131,8 +136,9 @@ def parse_query(raw: str) -> ParsedQuery:
             break
 
     # Clean up filler words
-    text = _FILLER_WORDS.sub("", text)
-    text = re.sub(r'\s+', ' ', text).strip()
+    cleaned_text = _FILLER_WORDS.sub("", text)
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
 
-    result.text = text
+    # If removing filler words left the string empty, retain original text
+    result.text = cleaned_text if cleaned_text else text
     return result

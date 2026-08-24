@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "LocalMind",
-  "version": "0.1.0",
-  "identifier": "com.localmind.app",
+  "version": "2.0.0",
+  "identifier": "com.localmind.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -23,7 +23,7 @@
         "center": true,
         "visible": false,
         "skipTaskbar": true,
-        "resizable": false
+        "resizable": true
       }
     ],
     "security": {

@@ -30,3 +30,26 @@ pub fn set_sidecar_pid(app: &AppHandle, pid: u32) {
         *p = Some(pid);
     }
 }
+
+pub fn kill_sidecar(app: &AppHandle) {
+    if let Ok(mut pid_guard) = app.state::<SidecarState>().child_pid.lock() {
+        if let Some(pid) = pid_guard.take() {
+            log::info!("Killing AI engine child process (PID: {})", pid);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                let _ = std::process::Command::new("taskkill")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .spawn();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .spawn();
+            }
+        }
+    }
+}

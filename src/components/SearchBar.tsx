@@ -1,29 +1,39 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Search,
   Settings,
   X,
-  Loader2,
-  Cpu,
   Clock,
   FileText,
   Star,
+  Sparkles,
+  Trash2,
+  History,
+  Columns2,
 } from "lucide-react";
-import { clsx } from "clsx";
-import { useSearch } from "../hooks/useSearch";
+import { useSearch, type SearchResult, type SearchTab } from "../hooks/useSearch";
 import { useIndexStatus } from "../hooks/useIndexStatus";
 import { ResultsList } from "./ResultsList";
 import { TabSelector } from "./TabSelector";
 import { IndexProgress } from "./IndexProgress";
+import { EngineStatus } from "./EngineStatus";
 import { FilePreview } from "./FilePreview";
+import { ActionMenu } from "./ActionMenu";
+import { SplitPreviewPanel } from "./SplitPreviewPanel";
 import type { RecentFile, PinnedFile, AppConfig } from "../lib/config";
 import { isPinned } from "../lib/config";
+import { groupResults, flattenGroups } from "../lib/grouping";
 
 interface SearchBarProps {
   onOpenSettings: () => void;
   onOpenFile: (path: string) => void;
   onOpenFolder: (path: string) => void;
+  onOpenInVscode: (path: string) => void;
+  onOpenInTerminal: (path: string) => void;
+  onRunAsAdmin: (path: string) => void;
+  onSystemCommand: (cmd: string) => void;
+  onDeleteFile: (path: string) => void;
   sidecarConnected: boolean;
   modelReady: boolean;
   sidecarLoading: boolean;
@@ -33,6 +43,7 @@ interface SearchBarProps {
   onAddSearchHistory: (query: string) => void;
   onRemoveSearchHistory: (query: string) => void;
   onClearSearchHistory: () => void;
+  onClearRecentFiles?: () => void;
   onTogglePin: (path: string, name: string) => void;
   config: AppConfig;
   sidecarPort: number | null;
@@ -43,6 +54,11 @@ export function SearchBar({
   onOpenSettings,
   onOpenFile,
   onOpenFolder,
+  onOpenInVscode,
+  onOpenInTerminal,
+  onRunAsAdmin,
+  onSystemCommand,
+  onDeleteFile,
   sidecarConnected,
   modelReady,
   sidecarLoading,
@@ -52,6 +68,7 @@ export function SearchBar({
   onAddSearchHistory,
   onRemoveSearchHistory,
   onClearSearchHistory,
+  onClearRecentFiles,
   onTogglePin,
   config,
   sidecarPort,
@@ -61,44 +78,95 @@ export function SearchBar({
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [inputValue, setInputValue] = useState("");
-  const [previewFile, setPreviewFile] = useState<{ path: string; name: string; line?: number } | null>(null);
+  const [previewFile, setPreviewFile] = useState<{
+    path: string;
+    name: string;
+    line?: number;
+    icon?: string;
+    category?: string;
+  } | null>(null);
+  const [actionMenuTarget, setActionMenuTarget] = useState<SearchResult | null>(null);
+  const [viewMode, setViewMode] = useState<"compact" | "split">(() => {
+    try {
+      return (localStorage.getItem("localmind_view_mode") as "compact" | "split") || "compact";
+    } catch {
+      return "compact";
+    }
+  });
+
+  const handleToggleViewMode = useCallback(async (newMode?: "compact" | "split") => {
+    const target = newMode ?? (viewMode === "compact" ? "split" : "compact");
+    setViewMode(target);
+    try {
+      localStorage.setItem("localmind_view_mode", target);
+      const { getCurrentWindow, LogicalSize } = await import("@tauri-apps/api/window");
+      const win = getCurrentWindow();
+      if (target === "split") {
+        await win.setSize(new LogicalSize(960, 580));
+      } else {
+        await win.setSize(new LogicalSize(680, 560));
+      }
+    } catch (err) {
+      console.warn("Window resize error:", err);
+    }
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode === "split") {
+      handleToggleViewMode("split");
+    }
+  }, []);
+
   const { results, loading, error, activeTab, search, searchSimilar, setActiveTab, clearSearch } =
-    useSearch();
-  const { indexStatus } = useIndexStatus();
+    useSearch(sidecarPort);
+  const { indexStatus, stopIndexing } = useIndexStatus(sidecarPort);
+
+  // Results are shown in sections; keyboard navigation walks the same order,
+  // so `ordered` — not the raw response — is what the arrow keys index into.
+  const groups = useMemo(() => groupResults(results, activeTab), [results, activeTab]);
+  const ordered = useMemo(() => flattenGroups(groups), [groups]);
+
+  // A shrinking result set must never leave the cursor pointing past the end.
+  useEffect(() => {
+    setSelectedIndex((prev) => (prev >= ordered.length ? Math.max(ordered.length - 1, 0) : prev));
+  }, [ordered.length]);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const [showReadyBanner, setShowReadyBanner] = useState(false);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
-  useEffect(() => {
-    if (sidecarConnected && modelReady && indexStatus.status === "complete") {
-      setShowReadyBanner(true);
-    }
-  }, [sidecarConnected, modelReady, indexStatus.status]);
-
   const triggerSearch = useCallback(
-    (value: string) => {
+    (value: string, tab?: SearchTab) => {
       clearTimeout(debounceRef.current);
       if (!value.trim()) {
-        search(value);
+        clearSearch();
         return;
       }
-      debounceRef.current = setTimeout(() => {
-        search(value);
-      }, 300);
+      search(value, tab);
     },
-    [search],
+    [search, clearSearch],
   );
 
   const handleInput = useCallback(
     (value: string) => {
       setInputValue(value);
+      setSelectedIndex(0);
       triggerSearch(value);
     },
     [triggerSearch],
+  );
+
+  const handleTabChange = useCallback(
+    (tab: SearchTab) => {
+      setActiveTab(tab);
+      setSelectedIndex(0);
+      if (inputValue.trim()) {
+        triggerSearch(inputValue, tab);
+      }
+    },
+    [setActiveTab, inputValue, triggerSearch],
   );
 
   const handleClear = useCallback(() => {
@@ -106,23 +174,6 @@ export function SearchBar({
     clearSearch();
     inputRef.current?.focus();
   }, [clearSearch]);
-
-  const handleSearchSubmit = useCallback(() => {
-    if (results[selectedIndex]) {
-      onOpenFile(results[selectedIndex].filePath);
-    }
-    if (inputValue.trim()) {
-      onAddSearchHistory(inputValue.trim());
-    }
-  }, [results, selectedIndex, inputValue, onOpenFile, onAddSearchHistory]);
-
-  const handleHistoryClick = useCallback(
-    (query: string) => {
-      setInputValue(query);
-      search(query);
-    },
-    [search],
-  );
 
   const handleCopyPath = useCallback(async (path: string) => {
     try {
@@ -132,36 +183,74 @@ export function SearchBar({
     }
   }, []);
 
+  const handleExecuteResult = useCallback(
+    (result: SearchResult) => {
+      if (result.category === "calc" || result.category === "converter" || result.action === "copy") {
+        handleCopyPath(result.filePath);
+      } else if (result.category === "action" && result.action === "system_command") {
+        onSystemCommand(result.filePath);
+      } else {
+        onOpenFile(result.filePath);
+      }
+
+      if (inputValue.trim()) {
+        onAddSearchHistory(inputValue.trim());
+      }
+    },
+    [handleCopyPath, onSystemCommand, onOpenFile, inputValue, onAddSearchHistory],
+  );
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // Ctrl+1..9: open Nth result directly
-      if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
+      if (actionMenuTarget) {
+        return;
+      }
+
+      // Ctrl+K / Alt+K: Toggle Action Menu
+      if ((e.ctrlKey || e.altKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
-        const idx = parseInt(e.key) - 1;
-        if (results[idx]) {
-          onOpenFile(results[idx].filePath);
-          if (inputValue.trim()) onAddSearchHistory(inputValue.trim());
+        if (ordered[selectedIndex]) {
+          setActionMenuTarget(ordered[selectedIndex]);
         }
         return;
       }
 
-      // Ctrl+P: toggle preview
-      if (e.ctrlKey && e.key.toLowerCase() === "p") {
+      // Ctrl+1..9: open Nth result directly
+      if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
         e.preventDefault();
-        if (results[selectedIndex]) {
-          const r = results[selectedIndex];
+        const idx = parseInt(e.key) - 1;
+        if (ordered[idx]) {
+          handleExecuteResult(ordered[idx]);
+        }
+        return;
+      }
+
+      // Ctrl+P / Cmd+P: toggle PowerToys Peek preview
+      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "p" || e.code === "KeyP")) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (ordered[selectedIndex]) {
+          const r = ordered[selectedIndex];
           setPreviewFile((prev) =>
-            prev?.path === r.filePath ? null : { path: r.filePath, name: r.fileName, line: r.lineStart },
+            prev?.path === r.filePath
+              ? null
+              : {
+                  path: r.filePath,
+                  name: r.fileName,
+                  line: r.lineStart,
+                  icon: r.icon,
+                  category: r.category,
+                },
           );
         }
         return;
       }
 
       // Ctrl+Shift+C: copy selected result path
-      if (e.ctrlKey && e.shiftKey && e.key === "C") {
+      if (e.ctrlKey && (e.key === "c" || e.key === "C") && e.shiftKey) {
         e.preventDefault();
-        if (results[selectedIndex]) {
-          handleCopyPath(results[selectedIndex].filePath);
+        if (ordered[selectedIndex]) {
+          handleCopyPath(ordered[selectedIndex].filePath);
         }
         return;
       }
@@ -169,360 +258,384 @@ export function SearchBar({
       // Ctrl+Enter: open folder of selected result
       if (e.ctrlKey && e.key === "Enter") {
         e.preventDefault();
-        if (results[selectedIndex]) {
-          onOpenFolder(results[selectedIndex].filePath);
+        if (ordered[selectedIndex]) {
+          onOpenFolder(ordered[selectedIndex].filePath);
         }
+        return;
+      }
+
+      // Ctrl+B / Alt+S / Ctrl+\: toggle Compact vs Split View
+      if (
+        ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "b" || e.code === "KeyB")) ||
+        (e.altKey && (e.key.toLowerCase() === "s" || e.code === "KeyS")) ||
+        ((e.ctrlKey || e.metaKey) && e.key === "\\")
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleToggleViewMode();
         return;
       }
 
       switch (e.key) {
         case "ArrowDown":
           e.preventDefault();
-          setSelectedIndex((prev) => Math.min(prev + 1, results.length - 1));
+          setSelectedIndex((prev) => Math.min(prev + 1, ordered.length - 1));
           break;
         case "ArrowUp":
           e.preventDefault();
           setSelectedIndex((prev) => Math.max(prev - 1, 0));
           break;
+        case "Home":
+          e.preventDefault();
+          setSelectedIndex(0);
+          break;
+        case "End":
+          e.preventDefault();
+          setSelectedIndex(Math.max(ordered.length - 1, 0));
+          break;
+        case "PageDown":
+          e.preventDefault();
+          setSelectedIndex((prev) => Math.min(prev + 5, ordered.length - 1));
+          break;
+        case "PageUp":
+          e.preventDefault();
+          setSelectedIndex((prev) => Math.max(prev - 5, 0));
+          break;
         case "Enter":
           e.preventDefault();
-          handleSearchSubmit();
+          if (ordered[selectedIndex]) {
+            handleExecuteResult(ordered[selectedIndex]);
+          }
           break;
         case "Tab": {
           e.preventDefault();
-          const tabs: Array<"files" | "semantic" | "apps"> = ["files", "semantic", "apps"];
-          const nextIdx = (tabs.indexOf(activeTab) + 1) % tabs.length;
-          const nextTab = tabs[nextIdx];
-          setActiveTab(nextTab);
-          if (inputValue.trim()) {
-            search(inputValue, nextTab);
-          }
+          const tabs: SearchTab[] = ["all", "apps", "files", "content"];
+          const curIdx = tabs.indexOf(activeTab);
+          const nextIdx = e.shiftKey
+            ? (curIdx - 1 + tabs.length) % tabs.length
+            : (curIdx + 1) % tabs.length;
+          handleTabChange(tabs[nextIdx]);
           break;
         }
         case "Escape":
           e.preventDefault();
-          if (inputValue) {
+          if (previewFile) {
+            setPreviewFile(null);
+          } else if (inputValue) {
             handleClear();
           }
           break;
       }
     },
-    [results, selectedIndex, activeTab, inputValue, onOpenFile, onOpenFolder, setActiveTab, search, handleClear, handleSearchSubmit, handleCopyPath, onAddSearchHistory],
+    [actionMenuTarget, ordered, selectedIndex, handleExecuteResult, previewFile, inputValue, handleCopyPath, onOpenFolder, activeTab, handleTabChange, handleClear, handleToggleViewMode],
   );
-
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [results]);
-
-  const showStatus = !sidecarConnected || !modelReady || !!sidecarError;
-  const showIdleContent = !inputValue.trim();
-  const hasPinned = pinnedFiles.length > 0;
-  const hasHistory = searchHistory.length > 0;
-  const hasRecent = recentFiles.length > 0;
-  const showIdlePanel = showIdleContent && (hasPinned || hasHistory || hasRecent);
 
   return (
     <div
-      className={clsx(
-        "w-full max-w-[680px] mx-auto",
-        "bg-white dark:bg-neutral-900",
-        "rounded-2xl shadow-2xl shadow-black/30 dark:shadow-black/70",
-        "border border-neutral-200 dark:border-neutral-700",
-        "overflow-hidden",
-        "animate-fade-in",
-      )}
+      className={`w-full rounded-2xl bg-white/90 dark:bg-neutral-900/90 backdrop-blur-2xl border border-black/10 dark:border-white/10 shadow-2xl overflow-hidden flex flex-col transition-all duration-200 ${
+        viewMode === "split" ? "max-w-5xl" : "max-w-2xl"
+      }`}
     >
-      {showStatus && (
-        <div className="flex flex-col gap-1 px-4 py-2 bg-neutral-50 dark:bg-neutral-800/50 border-b border-neutral-100 dark:border-neutral-800">
-          <div className="flex items-center gap-2">
-            {sidecarLoading ? (
-              <Loader2 size={14} className="animate-spin text-neutral-400" />
-            ) : (
-              <Cpu size={14} className="text-amber-500 animate-pulse" />
-            )}
-            <span className="text-xs text-neutral-500 dark:text-neutral-400">
-              {sidecarError
-                ? t("search.sidecarError")
-                : !sidecarConnected
-                  ? t("search.connecting")
-                  : !modelReady
-                    ? t("search.loadingModel")
-                    : t("search.buildingIndex")}
-            </span>
-          </div>
-          {sidecarError && (
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] text-red-500 dark:text-red-400 truncate max-w-[70%]">
-                {sidecarError}
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => window.location.reload()}
-                  className="px-2 py-1 text-[11px] rounded-md bg-neutral-800 dark:bg-neutral-200 text-white dark:text-neutral-900 hover:bg-neutral-700 dark:hover:bg-neutral-300 transition-colors"
-                >
-                  {t("search.retry")}
-                </button>
-                <button
-                  onClick={async () => {
-                    try {
-                      const { invoke } = await import("@tauri-apps/api/core");
-                      await invoke("open_logs");
-                    } catch {
-                      // noop
-                    }
-                  }}
-                  className="px-2 py-1 text-[11px] rounded-md border border-neutral-300 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
-                >
-                  {t("search.showLogs")}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {/* Search Input Bar */}
+      <div className="relative flex items-center gap-3 px-4 py-3.5 border-b border-black/5 dark:border-white/5">
+        <Search size={18} className="text-blue-500 shrink-0" />
 
-      <div className="flex items-center gap-3 px-4 py-3">
-        {loading ? (
-          <Loader2 size={20} className="animate-spin text-neutral-400 dark:text-neutral-500 shrink-0" />
-        ) : (
-          <Search size={20} className="text-neutral-400 dark:text-neutral-500 shrink-0" />
-        )}
         <input
           ref={inputRef}
           type="text"
           value={inputValue}
           onChange={(e) => handleInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={
-            !sidecarConnected || !modelReady
-              ? t("search.setupPlaceholder")
-              : t("search.placeholder")
-          }
-          className={clsx(
-            "flex-1 bg-transparent outline-none",
-            "text-sm text-neutral-800 dark:text-neutral-200",
-            "placeholder:text-neutral-400 dark:placeholder:text-neutral-500",
-          )}
-          spellCheck={false}
-          autoComplete="off"
-          disabled={!sidecarConnected}
+          placeholder={t("search.placeholder", "Search apps, files, content, math...")}
+          className="flex-1 bg-transparent text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-500 text-sm font-medium focus:outline-none"
+          autoFocus
         />
 
-        <div className="flex items-center gap-1.5 shrink-0">
-          {inputValue && (
-            <button
-              onClick={handleClear}
-              className="p-1 rounded-md hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 dark:text-neutral-500 transition-colors"
-            >
-              <X size={16} />
-            </button>
-          )}
-          <TabSelector activeTab={activeTab} onTabChange={(tab) => {
-            setActiveTab(tab);
-            if (inputValue.trim()) search(inputValue, tab);
-          }} />
+        {inputValue && (
           <button
-            onClick={onOpenSettings}
-            className="p-1.5 rounded-md hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-400 dark:text-neutral-500 transition-colors"
-            title={t("settings.title")}
+            onClick={handleClear}
+            className="p-1 rounded-full text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 transition-colors"
           >
-            <Settings size={16} />
+            <X size={14} />
           </button>
-        </div>
+        )}
+
+        <TabSelector activeTab={activeTab} onTabChange={handleTabChange} />
+
+        {/* View Mode Toggle Button */}
+        <button
+          onClick={() => handleToggleViewMode()}
+          className={`p-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+            viewMode === "split"
+              ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 font-semibold"
+              : "text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+          }`}
+          title={viewMode === "split" ? t("search.switchToCompact", "Switch to Compact Mode (Ctrl+B)") : t("search.switchToSplit", "Switch to Split View (Ctrl+B)")}
+        >
+          <Columns2 size={16} />
+          <span className="text-[11px] hidden sm:inline">{viewMode === "split" ? t("search.split", "Split") : t("search.compact", "Compact")}</span>
+        </button>
+
+        <button
+          onClick={onOpenSettings}
+          className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          title={t("settings.title", "Settings")}
+        >
+          <Settings size={16} />
+        </button>
       </div>
 
-      {/* Divider when content below */}
-      {(inputValue || showIdlePanel || indexStatus.status === "indexing" || showReadyBanner) && (
-        <div className="border-t border-neutral-100 dark:border-neutral-800" />
-      )}
+      {/* Engine startup, then indexing progress */}
+      <EngineStatus
+        connected={sidecarConnected}
+        modelReady={modelReady}
+        loading={sidecarLoading}
+        error={sidecarError}
+      />
+      <IndexProgress status={indexStatus} onStop={stopIndexing} />
 
-      {showReadyBanner && (
-        <div className="px-4 py-2 flex items-center justify-between text-[11px] text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20">
-          <span>{t("search.ready")}</span>
-          <button
-            onClick={() => setShowReadyBanner(false)}
-            className="text-[11px] text-emerald-700 dark:text-emerald-300 hover:underline"
-          >
-            {t("search.dismiss")}
-          </button>
-        </div>
-      )}
-
-      {/* Search results when typing */}
-      {!showIdleContent && (
-        <ResultsList
-          results={results}
-          loading={loading}
-          error={error}
-          query={inputValue}
-          selectedIndex={selectedIndex}
-          onOpenFile={(path) => {
-            onOpenFile(path);
-            if (inputValue.trim()) onAddSearchHistory(inputValue.trim());
-          }}
-          onOpenFolder={onOpenFolder}
-          onTogglePin={onTogglePin}
-          onCopyPath={handleCopyPath}
-          onSearchSimilar={(filePath) => {
-            searchSimilar(filePath);
-            setInputValue(`Similar: ${filePath.split(/[\\/]/).pop()}`);
-          }}
-          config={config}
-        />
-      )}
-
-      {/* Idle content: pinned, history, recent */}
-      {showIdlePanel && (
-        <div className="max-h-[340px] overflow-y-auto">
-          {/* Pinned files */}
-          {hasPinned && (
-            <div className="px-4 pt-2 pb-1">
-              <div className="flex items-center gap-1.5 mb-1.5">
-                <Star size={12} className="text-amber-500" />
-                <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                  {t("search.pinnedFiles")}
-                </span>
-              </div>
-              {pinnedFiles.map((file) => (
-                <div
-                  key={file.path}
-                  className="group flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors animate-slide-fade-in"
-                  onClick={() => onOpenFile(file.path)}
-                >
-                  <FileText size={14} className="text-neutral-400 shrink-0" />
-                  <span className="text-xs text-neutral-700 dark:text-neutral-300 truncate flex-1">
-                    {file.name}
-                  </span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onTogglePin(file.path, file.name); }}
-                    className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-amber-500 transition-all"
-                  >
-                    <Star size={12} fill="currentColor" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Search history */}
-          {hasHistory && (
-            <div className="px-4 pt-2 pb-1">
-              <div className="flex items-center justify-between mb-1.5">
-                <div className="flex items-center gap-1.5">
-                  <Clock size={12} className="text-neutral-400" />
-                  <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                    {t("search.recentSearches")}
-                  </span>
-                </div>
-                <button
-                  onClick={onClearSearchHistory}
-                  className="text-[10px] text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
-                >
-                  {t("search.clearHistory")}
-                </button>
-              </div>
-              {searchHistory.slice(0, 8).map((query, i) => (
-                <div
-                  key={`${query}-${i}`}
-                  className="group flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors animate-slide-fade-in"
-                  style={{ animationDelay: `${i * 20}ms` }}
-                  onClick={() => handleHistoryClick(query)}
-                >
-                  <Search size={12} className="text-neutral-300 dark:text-neutral-600 shrink-0" />
-                  <span className="text-xs text-neutral-600 dark:text-neutral-400 truncate flex-1">
-                    {query}
-                  </span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onRemoveSearchHistory(query); }}
-                    className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400 transition-all"
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Recent files */}
-          {hasRecent && (
-            <div className="px-4 pt-2 pb-2">
-              <div className="flex items-center gap-1.5 mb-1.5">
-                <Clock size={12} className="text-neutral-400" />
-                <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                  {t("search.recentFiles")}
-                </span>
-              </div>
-              {recentFiles.slice(0, 8).map((file, i) => (
-                <div
-                  key={file.path}
-                  className="group flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors animate-slide-fade-in"
-                  style={{ animationDelay: `${i * 20}ms` }}
-                  onClick={() => onOpenFile(file.path)}
-                >
-                  <FileText size={14} className="text-neutral-400 shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <span className="text-xs text-neutral-700 dark:text-neutral-300 truncate block">
-                      {file.name}
-                    </span>
-                    <span className="text-[10px] text-neutral-400 dark:text-neutral-600 truncate block">
-                      {file.path}
-                    </span>
+      {/* Main Results or Empty State */}
+      <div className="flex-1 flex min-h-0 overflow-hidden">
+        {/* Left Column: Results or Empty State */}
+        <div
+          className={`flex-1 min-w-0 flex flex-col overflow-y-auto ${
+            viewMode === "split" ? "border-r border-black/5 dark:border-white/5" : ""
+          }`}
+        >
+          {inputValue.trim() ? (
+            <ResultsList
+              groups={groups}
+              loading={loading}
+              error={error}
+              query={inputValue}
+              selectedIndex={selectedIndex}
+              activeTab={activeTab}
+              onSelectIndex={setSelectedIndex}
+              onOpenResult={handleExecuteResult}
+              onOpenActionMenu={(res) => setActionMenuTarget(res)}
+              onOpenPreview={(res) =>
+                setPreviewFile({
+                  path: res.filePath,
+                  name: res.fileName,
+                  line: res.lineStart,
+                  icon: res.icon,
+                  category: res.category,
+                })
+              }
+              config={config}
+            />
+          ) : (
+            /* Empty State: Quick Access, Pinned, Recent Searches & Recent Files */
+            <div className="p-4 space-y-4 max-h-[380px] overflow-y-auto">
+              {/* Pinned Files */}
+              {pinnedFiles.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider mb-2">
+                    <Star size={12} className="text-amber-400 fill-amber-400" />
+                    <span>{t("search.pinnedFiles", "Pinned")}</span>
                   </div>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onTogglePin(file.path, file.name); }}
-                    className={clsx(
-                      "p-0.5 rounded transition-all",
-                      isPinned(config, file.path)
-                        ? "text-amber-500 opacity-100"
-                        : "text-neutral-400 opacity-0 group-hover:opacity-100 hover:bg-neutral-200 dark:hover:bg-neutral-700",
-                    )}
-                  >
-                    <Star size={12} fill={isPinned(config, file.path) ? "currentColor" : "none"} />
-                  </button>
+                  <div className="grid grid-cols-2 gap-2">
+                    {pinnedFiles.map((pf) => (
+                      <div
+                        key={pf.path}
+                        onClick={() => onOpenFile(pf.path)}
+                        className="flex items-center gap-2 px-3 py-2 rounded-xl bg-neutral-50 dark:bg-neutral-800/40 hover:bg-neutral-100 dark:hover:bg-neutral-800 cursor-pointer border border-black/5 dark:border-white/5 transition-all text-xs text-neutral-800 dark:text-neutral-200 font-medium truncate"
+                      >
+                        <FileText size={14} className="text-blue-500 shrink-0" />
+                        <span className="truncate">{pf.name}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))}
+              )}
+
+              {/* Recent Searches */}
+              {searchHistory && searchHistory.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider">
+                      <History size={12} />
+                      <span>{t("search.recentSearches", "Recent Searches")}</span>
+                    </div>
+                    <button
+                      onClick={onClearSearchHistory}
+                      className="text-[11px] text-neutral-400 hover:text-rose-500 dark:hover:text-rose-400 flex items-center gap-1 transition-colors px-1.5 py-0.5 rounded-md hover:bg-neutral-100 dark:hover:bg-neutral-800/60"
+                      title={t("search.clearHistory", "Clear")}
+                    >
+                      <Trash2 size={11} />
+                      <span>{t("search.clearHistory", "Clear")}</span>
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {searchHistory.slice(0, 8).map((queryText) => (
+                      <div
+                        key={queryText}
+                        onClick={() => {
+                          setInputValue(queryText);
+                          triggerSearch(queryText);
+                        }}
+                        className="group flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-neutral-100/80 dark:bg-neutral-800/60 hover:bg-neutral-200/80 dark:hover:bg-neutral-700/60 cursor-pointer transition-all text-xs text-neutral-700 dark:text-neutral-300 font-medium"
+                      >
+                        <span>{queryText}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveSearchHistory?.(queryText);
+                          }}
+                          className="opacity-0 group-hover:opacity-100 hover:text-rose-500 p-0.5 rounded transition-opacity"
+                          title="Remove"
+                        >
+                          <X size={11} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Recent Files */}
+              {recentFiles.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider">
+                      <Clock size={12} />
+                      <span>{t("search.recentFiles", "Recent Files")}</span>
+                    </div>
+                    {onClearRecentFiles && (
+                      <button
+                        onClick={onClearRecentFiles}
+                        className="text-[11px] text-neutral-400 hover:text-rose-500 dark:hover:text-rose-400 flex items-center gap-1 transition-colors px-1.5 py-0.5 rounded-md hover:bg-neutral-100 dark:hover:bg-neutral-800/60"
+                        title={t("search.clearHistory", "Clear")}
+                      >
+                        <Trash2 size={11} />
+                        <span>{t("search.clearHistory", "Clear")}</span>
+                      </button>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    {recentFiles.slice(0, 5).map((rf) => (
+                      <div
+                        key={rf.path}
+                        onClick={() => onOpenFile(rf.path)}
+                        className="flex items-center justify-between px-3 py-1.5 rounded-lg hover:bg-neutral-100/70 dark:hover:bg-neutral-800/50 cursor-pointer transition-colors text-xs text-neutral-700 dark:text-neutral-300"
+                      >
+                        <div className="flex items-center gap-2 truncate">
+                          <FileText size={13} className="text-neutral-400 shrink-0" />
+                          <span className="truncate font-medium">{rf.name}</span>
+                        </div>
+                        <span className="text-[10px] text-neutral-400 truncate max-w-[180px] ml-2">
+                          {rf.path}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Quick Tips */}
+              <div className="pt-2 border-t border-black/5 dark:border-white/5 flex items-center gap-1.5 text-[11px] text-neutral-400 dark:text-neutral-500">
+                <Sparkles size={12} className="text-amber-500 shrink-0" />
+                <span>
+                  {t("search.tipMath", "Type math like {{math}}, or an app name like {{app}}", {
+                    math: "150 * 4",
+                    app: "calc",
+                    interpolation: { escapeValue: false },
+                  })}
+                </span>
+              </div>
             </div>
           )}
         </div>
-      )}
 
-      <IndexProgress status={indexStatus} />
+        {/* Right Column: Live Split Preview Panel (Only in Split View) */}
+        {viewMode === "split" && (
+          <div className="w-[380px] shrink-0 hidden sm:flex flex-col min-h-0">
+            <SplitPreviewPanel
+              result={ordered[selectedIndex] ?? null}
+              onOpenFile={onOpenFile}
+              onOpenFolder={onOpenFolder}
+              onOpenInVscode={onOpenInVscode}
+              onOpenInTerminal={onOpenInTerminal}
+              onRunAsAdmin={onRunAsAdmin}
+              onCopyPath={handleCopyPath}
+            />
+          </div>
+        )}
+      </div>
 
-      {/* File Preview */}
+      {/* PowerToys Peek Modal Preview */}
       {previewFile && (
         <FilePreview
           filePath={previewFile.path}
           fileName={previewFile.name}
           lineStart={previewFile.line}
-          sidecarPort={sidecarPort}
+          icon={previewFile.icon}
+          category={previewFile.category}
           onClose={() => setPreviewFile(null)}
-          onOpenFile={onOpenFile}
+          onOpenFile={() => onOpenFile(previewFile.path)}
+          onOpenFolder={onOpenFolder}
         />
       )}
 
-      {/* Footer shortcuts */}
-      {!inputValue && !showIdlePanel && (
-        <div className="px-4 py-2 flex items-center justify-between text-[10px] text-neutral-400 dark:text-neutral-600 border-t border-neutral-100 dark:border-neutral-800/50">
-          <span>
-            <kbd className="px-1 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-500 font-mono">
-              Tab
-            </kbd>{" "}
-            {t("search.tabFiles")}/{t("search.tabSemantic")}
-          </span>
-          <span>
-            <kbd className="px-1 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-500 font-mono">
-              Enter
-            </kbd>{" "}
-            {t("results.openFile")}
-          </span>
-          <span>
-            <kbd className="px-1 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-500 font-mono">
-              Esc
-            </kbd>{" "}
-            {t("settings.cancel")}
-          </span>
-        </div>
+      {/* Raycast Action Menu Modal */}
+      {actionMenuTarget && (
+        <ActionMenu
+          isOpen={true}
+          onClose={() => setActionMenuTarget(null)}
+          result={actionMenuTarget}
+          onOpenFile={onOpenFile}
+          onOpenFolder={onOpenFolder}
+          onOpenInVscode={onOpenInVscode}
+          onOpenInTerminal={onOpenInTerminal}
+          onRunAsAdmin={onRunAsAdmin}
+          onCopyPath={handleCopyPath}
+          onTogglePreview={() => {
+            setPreviewFile({
+              path: actionMenuTarget.filePath,
+              name: actionMenuTarget.fileName,
+              line: actionMenuTarget.lineStart,
+              icon: actionMenuTarget.icon,
+              category: actionMenuTarget.category,
+            });
+          }}
+          onTogglePin={onTogglePin}
+          onSearchSimilar={searchSimilar}
+          onDeleteFile={onDeleteFile}
+          isPinned={isPinned(config, actionMenuTarget.filePath)}
+        />
       )}
+
+      {/* Raycast-style Status Footer */}
+      <div className="flex items-center justify-between px-4 py-2 border-t border-black/5 dark:border-white/5 bg-neutral-50/50 dark:bg-neutral-900/50 text-[11px] text-neutral-400 dark:text-neutral-500 select-none">
+        <div className="flex items-center gap-3 min-w-0 overflow-hidden">
+          {[
+            { keys: "↵", label: t("results.hintOpen", "Open") },
+            { keys: "Ctrl+↵", label: t("results.hintFolder", "Folder") },
+            { keys: "Ctrl+P", label: t("results.hintPreview", "Preview") },
+            { keys: "Ctrl+B", label: viewMode === "split" ? t("search.compact", "Compact") : t("search.split", "Split") },
+            { keys: "Tab", label: t("results.hintFilter", "Filter") },
+          ].map((hint) => (
+            <span key={hint.keys} className="flex items-center gap-1 shrink-0">
+              <kbd className="px-1 py-0.5 rounded bg-neutral-200/60 dark:bg-neutral-800 font-mono text-[10px]">
+                {hint.keys}
+              </kbd>
+              <span>{hint.label}</span>
+            </span>
+          ))}
+        </div>
+
+        <button
+          onClick={() => {
+            if (ordered[selectedIndex]) setActionMenuTarget(ordered[selectedIndex]);
+          }}
+          className="flex items-center gap-1 shrink-0 ml-3 hover:text-neutral-700 dark:hover:text-neutral-300 transition-colors cursor-pointer"
+        >
+          <span>{t("results.actions", "Actions")}</span>
+          <kbd className="px-1 py-0.5 rounded bg-neutral-200/60 dark:bg-neutral-800 font-mono text-[10px]">
+            Ctrl+K
+          </kbd>
+        </button>
+      </div>
     </div>
   );
 }

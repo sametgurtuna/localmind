@@ -1,34 +1,48 @@
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import {
   FileText,
-  FolderOpen,
-  ExternalLink,
   Star,
-  Copy,
   Code,
-  Terminal,
-  Layers,
+  Calculator,
+  Zap,
+  LayoutGrid,
+  FileCode,
+  FileSpreadsheet,
+  MoreHorizontal,
+  SearchX,
+  Eye,
+  ArrowRightLeft,
+  Globe,
+  Languages,
+  MapPin,
+  Youtube,
+  Github,
+  BookOpen,
+  ExternalLink,
+  Bot,
 } from "lucide-react";
 import { clsx } from "clsx";
-import type { SearchResult } from "../hooks/useSearch";
+import type { SearchResult, SearchTab } from "../hooks/useSearch";
+import type { GroupedResult, ResultGroup } from "../lib/grouping";
 import { isPinned, type AppConfig } from "../lib/config";
 
 interface ResultsListProps {
-  results: SearchResult[];
+  groups: ResultGroup[];
   loading: boolean;
   error: string | null;
   query: string;
   selectedIndex: number;
-  onOpenFile: (path: string) => void;
-  onOpenFolder: (path: string) => void;
-  onTogglePin: (path: string, name: string) => void;
-  onCopyPath: (path: string) => void;
-  onSearchSimilar: (filePath: string) => void;
+  activeTab: SearchTab;
+  onSelectIndex: (index: number) => void;
+  onOpenResult: (result: SearchResult) => void;
+  onOpenActionMenu: (result: SearchResult) => void;
+  onOpenPreview?: (result: SearchResult) => void;
   config: AppConfig;
 }
 
 function highlightMatch(text: string, query: string): React.ReactNode {
-  if (!query.trim()) return text;
+  if (!query.trim() || !text) return text;
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
   const parts: { text: string; highlight: boolean }[] = [];
   let remaining = text;
@@ -57,232 +71,345 @@ function highlightMatch(text: string, query: string): React.ReactNode {
     remaining = remaining.slice(earliest + matchLen);
   }
 
-  return parts.map((p, i) =>
-    p.highlight ? (
-      <mark key={i} className="bg-yellow-300/40 dark:bg-yellow-500/30 text-inherit rounded-sm px-0.5">
-        {p.text}
-      </mark>
-    ) : (
-      <span key={i}>{p.text}</span>
-    ),
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.highlight ? (
+          <mark
+            key={i}
+            className="bg-blue-500/20 dark:bg-blue-400/25 text-blue-900 dark:text-blue-100 rounded-[2px] px-0.5 not-italic font-semibold"
+          >
+            {p.text}
+          </mark>
+        ) : (
+          <span key={i}>{p.text}</span>
+        ),
+      )}
+    </>
   );
 }
 
-function getFileIcon(fileName: string) {
-  const ext = fileName.split(".").pop()?.toLowerCase();
-  const colorMap: Record<string, string> = {
-    py: "text-blue-500",
-    js: "text-yellow-500",
-    ts: "text-blue-400",
-    tsx: "text-blue-400",
-    jsx: "text-yellow-500",
-    html: "text-orange-500",
-    css: "text-purple-500",
-    json: "text-green-500",
-    md: "text-neutral-500",
-    pdf: "text-red-500",
-    docx: "text-blue-600",
-    txt: "text-neutral-400",
-    rs: "text-orange-600",
-    go: "text-cyan-500",
-    java: "text-red-400",
-    c: "text-blue-300",
-    cpp: "text-blue-300",
-    rb: "text-red-600",
-    sh: "text-green-400",
-    sql: "text-yellow-600",
-    xml: "text-orange-400",
-    yaml: "text-pink-400",
-    yml: "text-pink-400",
-    toml: "text-neutral-500",
-    csv: "text-green-600",
-    xlsx: "text-green-700",
-    pptx: "text-orange-600",
-  };
-  return colorMap[ext ?? ""] ?? "text-neutral-400";
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let val = bytes;
+  let unitIndex = 0;
+  while (val >= 1024 && unitIndex < units.length - 1) {
+    val /= 1024;
+    unitIndex++;
+  }
+  return `${val.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-async function openInVscode(path: string) {
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("open_in_vscode", { path });
-  } catch {
-    /* noop */
+function getResultIcon(result: SearchResult) {
+  if (result.icon && result.icon.startsWith("data:")) {
+    return (
+      <img
+        src={result.icon}
+        alt=""
+        className="w-[18px] h-[18px] object-contain shrink-0 rounded"
+        loading="lazy"
+      />
+    );
   }
+  if (result.category === "converter") {
+    return <ArrowRightLeft size={18} className="text-emerald-500 shrink-0" />;
+  }
+  if (result.category === "web") {
+    if (result.icon === "youtube") return <Youtube size={18} className="text-red-500 shrink-0" />;
+    if (result.icon === "github") return <Github size={18} className="text-neutral-700 dark:text-neutral-200 shrink-0" />;
+    if (result.icon === "wikipedia") return <BookOpen size={18} className="text-blue-400 shrink-0" />;
+    if (result.icon === "translate") return <Languages size={18} className="text-sky-500 shrink-0" />;
+    if (result.icon === "maps") return <MapPin size={18} className="text-red-400 shrink-0" />;
+    if (result.icon === "chatgpt") return <Bot size={18} className="text-emerald-500 shrink-0" />;
+    return <Globe size={18} className="text-blue-500 shrink-0" />;
+  }
+  if (result.category === "calc") {
+    return <Calculator size={18} className="text-amber-500 shrink-0" />;
+  }
+  if (result.category === "action") {
+    return <Zap size={18} className="text-purple-500 shrink-0" />;
+  }
+  if (result.category === "app") {
+    return <LayoutGrid size={18} className="text-blue-500 shrink-0" />;
+  }
+  if (result.category === "content") {
+    return <FileCode size={18} className="text-violet-500 shrink-0" />;
+  }
+
+  const ext = (result.fileExt || result.fileName.split(".").pop() || "").replace(".", "").toLowerCase();
+  const codeExts = ["ts", "tsx", "js", "jsx", "py", "rs", "go", "java", "c", "cpp", "html", "css", "json", "yaml", "yml", "sql", "sh"];
+  if (codeExts.includes(ext)) {
+    return <Code size={18} className="text-sky-500 shrink-0" />;
+  }
+  if (["xlsx", "csv"].includes(ext)) {
+    return <FileSpreadsheet size={18} className="text-emerald-500 shrink-0" />;
+  }
+  if (["pdf", "docx", "doc", "txt", "md"].includes(ext)) {
+    return <FileText size={18} className="text-rose-500 shrink-0" />;
+  }
+
+  return <FileText size={18} className="text-neutral-400 shrink-0" />;
 }
 
-async function openFileAtLine(path: string, line: number) {
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("open_file_at_line", { path, line });
-  } catch {
-    /* noop */
-  }
+function SkeletonRow() {
+  return (
+    <div className="flex items-center gap-3 px-3 py-2.5">
+      <div className="w-9 h-9 rounded-lg bg-neutral-150 dark:bg-neutral-800 animate-pulse" />
+      <div className="flex-1 space-y-1.5">
+        <div className="h-3 w-2/5 rounded bg-neutral-150 dark:bg-neutral-800 animate-pulse" />
+        <div className="h-2.5 w-3/4 rounded bg-neutral-100 dark:bg-neutral-800/60 animate-pulse" />
+      </div>
+    </div>
+  );
 }
 
-async function openInTerminal(path: string) {
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("open_in_terminal", { path });
-  } catch {
-    /* noop */
-  }
+interface RowProps {
+  result: GroupedResult;
+  isSelected: boolean;
+  query: string;
+  pinned: boolean;
+  onSelect: () => void;
+  onOpen: () => void;
+  onOpenActionMenu: () => void;
+  onOpenPreview?: () => void;
+  rowRef: React.Ref<HTMLDivElement> | null;
+}
+
+function ResultRow({
+  result,
+  isSelected,
+  query,
+  pinned,
+  onSelect,
+  onOpen,
+  onOpenActionMenu,
+  onOpenPreview,
+  rowRef,
+}: RowProps) {
+  const isCalc = result.category === "calc";
+  const isConverter = result.category === "converter";
+  const isWeb = result.category === "web";
+  const isApp = result.category === "app";
+  const isContent = result.category === "content";
+
+  return (
+    <div
+      ref={rowRef}
+      role="option"
+      aria-selected={isSelected}
+      onClick={onOpen}
+      onMouseMove={onSelect}
+      className={clsx(
+        "group relative flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl cursor-pointer select-none",
+        "transition-colors duration-100",
+        isSelected
+          ? "bg-blue-500/10 dark:bg-blue-500/15 text-neutral-900 dark:text-white border border-blue-500/25 dark:border-blue-400/25"
+          : "hover:bg-neutral-100/70 dark:hover:bg-neutral-800/50 text-neutral-700 dark:text-neutral-300 border border-transparent",
+      )}
+    >
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        <div
+          className={clsx(
+            "p-2 rounded-lg flex items-center justify-center transition-colors",
+            isSelected ? "bg-white dark:bg-neutral-800 shadow-xs" : "bg-neutral-100 dark:bg-neutral-800/60",
+          )}
+        >
+          {getResultIcon(result)}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span
+              className={clsx(
+                "text-sm font-semibold truncate",
+                isCalc && "font-mono text-base text-amber-600 dark:text-amber-400",
+                isConverter && "text-[14px] font-bold text-emerald-600 dark:text-emerald-400",
+                isWeb && "text-blue-600 dark:text-blue-400",
+              )}
+            >
+              {highlightMatch(result.fileName, query)}
+            </span>
+
+            {isConverter && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">
+                Unit & Currency
+              </span>
+            )}
+
+            {isWeb && (
+              <ExternalLink size={12} className="text-blue-400 shrink-0 opacity-70" />
+            )}
+
+            {pinned && <Star size={12} className="text-amber-400 fill-amber-400 shrink-0" />}
+
+            {result.lineStart !== undefined && result.lineStart > 0 && (
+              <span className="text-[10px] text-neutral-400 font-mono shrink-0">L{result.lineStart}</span>
+            )}
+          </div>
+
+          <div className="text-xs text-neutral-400 dark:text-neutral-500 truncate mt-0.5">
+            {isContent ? (
+              <span className="font-mono text-[11px] text-neutral-600 dark:text-neutral-300">
+                {highlightMatch(result.snippet, query)}
+              </span>
+            ) : (
+              <span>{result.snippet || result.filePath}</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 shrink-0">
+        {!isCalc && !isConverter && !isWeb && !isApp && result.fileSize ? (
+          <span className="text-[11px] text-neutral-400 dark:text-neutral-500 font-mono tabular-nums hidden sm:inline">
+            {formatBytes(result.fileSize)}
+          </span>
+        ) : null}
+
+        {onOpenPreview && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenPreview();
+            }}
+            className={clsx(
+              "p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 transition-opacity",
+              isSelected
+                ? "opacity-100 bg-neutral-200/50 dark:bg-neutral-700/50"
+                : "opacity-0 group-hover:opacity-100",
+            )}
+            title="Preview (Ctrl+P)"
+          >
+            <Eye size={14} />
+          </button>
+        )}
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenActionMenu();
+          }}
+          className={clsx(
+            "p-1.5 rounded-lg text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 transition-opacity",
+            isSelected
+              ? "opacity-100 bg-neutral-200/50 dark:bg-neutral-700/50"
+              : "opacity-0 group-hover:opacity-100",
+          )}
+          title="Actions (Ctrl+K)"
+        >
+          <MoreHorizontal size={14} />
+        </button>
+      </div>
+    </div>
+  );
 }
 
 export function ResultsList({
-  results,
+  groups,
   loading,
   error,
   query,
   selectedIndex,
-  onOpenFile,
-  onOpenFolder,
-  onTogglePin,
-  onCopyPath,
-  onSearchSimilar,
+  activeTab,
+  onSelectIndex,
+  onOpenResult,
+  onOpenActionMenu,
+  onOpenPreview,
   config,
 }: ResultsListProps) {
   const { t } = useTranslation();
+  const listRef = useRef<HTMLDivElement>(null);
+  const selectedRef = useRef<HTMLDivElement>(null);
+  const total = groups.reduce((n, g) => n + g.items.length, 0);
 
-  if (loading) {
+  useEffect(() => {
+    selectedRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedIndex]);
+
+  if (loading && total === 0) {
     return (
-      <div className="flex items-center justify-center py-8">
-        <div className="w-5 h-5 border-2 border-neutral-300 dark:border-neutral-600 border-t-neutral-600 dark:border-t-neutral-300 rounded-full animate-spin" />
+      <div className="px-2 py-1" aria-busy="true">
+        <SkeletonRow />
+        <SkeletonRow />
+        <SkeletonRow />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="px-4 py-6 text-center text-sm text-red-500 dark:text-red-400">
+      <div className="m-2 px-4 py-8 text-center text-sm text-red-500 dark:text-red-400 bg-red-50/40 dark:bg-red-950/20 rounded-xl">
         {error}
       </div>
     );
   }
 
-  if (query && results.length === 0) {
+  if (query && total === 0) {
     return (
-      <div className="px-4 py-8 text-center text-sm text-neutral-400 dark:text-neutral-500">
-        {t("search.noResults")}
+      <div className="px-6 py-12 flex flex-col items-center gap-2 text-center">
+        <SearchX size={22} className="text-neutral-300 dark:text-neutral-600" />
+        <span className="text-sm text-neutral-500 dark:text-neutral-400">
+          {t("search.noResults", "No results found")}
+        </span>
+        <span className="text-xs text-neutral-400 dark:text-neutral-600 max-w-xs leading-relaxed">
+          {t(
+            "search.noResultsHint",
+            "Try a different word, or switch tabs with Tab to search apps, filenames or file contents.",
+          )}
+        </span>
       </div>
     );
   }
 
-  if (!query) return null;
+  if (total === 0) return null;
+
+  const showHeaders = activeTab === "all" && groups.length > 1;
 
   return (
-    <div className="max-h-[340px] overflow-y-auto">
-      {results.map((result, index) => {
-        const pinned = isPinned(config, result.filePath);
-        return (
-          <div
-            key={`${result.filePath}-${result.chunkIndex ?? index}`}
-            className={clsx(
-              "group flex items-start gap-3 px-4 py-2.5 cursor-pointer transition-colors duration-100 animate-slide-fade-in",
-              index === selectedIndex
-                ? "bg-neutral-100 dark:bg-neutral-800/80"
-                : "hover:bg-neutral-50 dark:hover:bg-neutral-800/40",
-            )}
-            style={{ animationDelay: `${index * 30}ms` }}
-            onClick={() => {
-              if (result.lineStart && result.lineStart > 0) {
-                openFileAtLine(result.filePath, result.lineStart);
-              } else {
-                onOpenFile(result.filePath);
-              }
-            }}
-          >
-            <FileText
-              size={18}
-              className={clsx("mt-0.5 shrink-0", getFileIcon(result.fileName))}
-            />
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium text-neutral-800 dark:text-neutral-200 truncate">
-                  {result.fileName}
-                </span>
-                {result.score > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-100 dark:bg-neutral-700 text-neutral-500 dark:text-neutral-400">
-                    {Math.round(result.score * 100)}%
-                  </span>
-                )}
-                {result.lineStart && result.lineStart > 0 && (
-                  <span className="text-[10px] px-1 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 text-blue-500 dark:text-blue-400 font-mono">
-                    L{result.lineStart}
-                  </span>
-                )}
-                {pinned && (
-                  <Star size={10} className="text-amber-500" fill="currentColor" />
-                )}
-              </div>
-              <p className="text-xs text-neutral-400 dark:text-neutral-500 truncate mt-0.5">
-                {result.filePath}
-              </p>
-              {result.snippet && (
-                <p className="text-xs text-neutral-600 dark:text-neutral-400 mt-1 line-clamp-2 leading-relaxed">
-                  {highlightMatch(result.snippet, query)}
-                </p>
-              )}
+    <div
+      ref={listRef}
+      role="listbox"
+      className={clsx(
+        "max-h-[380px] overflow-y-auto px-2 py-1 custom-scrollbar",
+        loading && "opacity-60 transition-opacity",
+      )}
+    >
+      {groups.map((group) => (
+        <div key={group.category} className="mb-1 last:mb-0">
+          {showHeaders && (
+            <div className="flex items-center gap-2 px-3 pt-2 pb-1">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
+                {t(group.labelKey, group.fallbackLabel)}
+              </span>
+              <span className="text-[10px] text-neutral-300 dark:text-neutral-600 tabular-nums">
+                {group.items.length}
+              </span>
+              <div className="flex-1 h-px bg-black/5 dark:bg-white/5" />
             </div>
-            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 mt-0.5">
-              <button
-                onClick={(e) => { e.stopPropagation(); onTogglePin(result.filePath, result.fileName); }}
-                className={clsx(
-                  "p-1 rounded transition-colors",
-                  pinned
-                    ? "text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/30"
-                    : "text-neutral-400 hover:bg-neutral-200 dark:hover:bg-neutral-700",
-                )}
-                title={pinned ? t("results.unpin") : t("results.pin")}
-              >
-                <Star size={13} fill={pinned ? "currentColor" : "none"} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); onCopyPath(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("results.copyPath")}
-              >
-                <Copy size={13} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); onSearchSimilar(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("search.similarFiles")}
-              >
-                <Layers size={13} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); openInVscode(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("results.openInVscode")}
-              >
-                <Code size={13} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); openInTerminal(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("results.openInTerminal")}
-              >
-                <Terminal size={13} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); onOpenFile(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("results.openFile")}
-              >
-                <ExternalLink size={13} />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); onOpenFolder(result.filePath); }}
-                className="p-1 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-400"
-                title={t("results.openFolder")}
-              >
-                <FolderOpen size={13} />
-              </button>
-            </div>
+          )}
+
+          <div className="space-y-0.5">
+            {group.items.map((result) => {
+              const isSelected = result.flatIndex === selectedIndex;
+              return (
+                <ResultRow
+                  key={`${result.filePath}-${result.chunkIndex ?? result.flatIndex}`}
+                  result={result}
+                  isSelected={isSelected}
+                  query={query}
+                  pinned={isPinned(config, result.filePath)}
+                  onSelect={() => onSelectIndex(result.flatIndex)}
+                  onOpen={() => onOpenResult(result)}
+                  onOpenActionMenu={() => onOpenActionMenu(result)}
+                  onOpenPreview={onOpenPreview ? () => onOpenPreview(result) : undefined}
+                  rowRef={isSelected ? selectedRef : null}
+                />
+              );
+            })}
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 }

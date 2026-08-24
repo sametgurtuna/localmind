@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -25,10 +26,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
 import embedder
+import settings as engine_settings
 from indexer import index_files, rebuild_index, index_state
 from search import semantic_search
-from file_search import fuzzy_file_search
+from file_search import fuzzy_file_search, refresh_file_cache
 from app_launcher import search_apps
+from evaluator import evaluate_quick_query
 from watcher import FileWatcher
 from extractor import SUPPORTED_EXTENSIONS, extract_text
 
@@ -38,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("localmind")
 
-app = FastAPI(title="LocalMind AI Engine", version="0.2.0")
+app = FastAPI(title="LocalMind AI Engine", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,54 +67,99 @@ def _load_model_background():
         _model_ready.set()
 
 
+# Watcher events are collected here and applied in batches by a single worker
+# thread, so a burst of saves (a build, a git checkout) costs one flush instead
+# of one delete + embed round-trip per file on the watchdog thread.
+_pending_changes: dict[str, str] = {}
+_pending_lock = threading.Lock()
+_pending_event = threading.Event()
+_CHANGE_FLUSH_DELAY = 3.0
+
+
 def _on_file_change(path: str, event_type: str):
     if not _model_ready.is_set():
         return
-    logger.info("File %s: %s", event_type, path)
-    if event_type == "deleted":
-        db.remove_file_chunks(path)
-    elif event_type in ("created", "modified"):
-        from chunker import chunk_text_with_lines
-        from indexer import file_hash
+    with _pending_lock:
+        # A later delete supersedes an earlier upsert and vice versa.
+        _pending_changes[path] = event_type
+    _pending_event.set()
 
-        db.remove_file_chunks(path)
-        text = extract_text(path)
-        if text:
-            chunks_with_lines = chunk_text_with_lines(text)
-            if chunks_with_lines:
-                fname = os.path.basename(path)
-                path_hint = path.replace("\\", "/")
-                file_context = f"[File: {fname} | Path: {path_hint}]\n"
-                texts = [file_context + c[0] for c in chunks_with_lines]
-                vectors = embedder.get_embeddings(texts)
-                ext = Path(path).suffix.lower()
+
+def _change_worker():
+    """Apply queued file changes in batches."""
+    from chunker import chunk_text_with_lines
+    from indexer import context_header, file_hash
+
+    while True:
+        _pending_event.wait()
+        time.sleep(_CHANGE_FLUSH_DELAY)  # let a burst settle
+        with _pending_lock:
+            batch = dict(_pending_changes)
+            _pending_changes.clear()
+            _pending_event.clear()
+        if not batch:
+            continue
+
+        if _index_thread is not None and _index_thread.is_alive():
+            # A full index run is already rewriting these rows.
+            continue
+
+        try:
+            # One delete statement covers the whole batch, including the
+            # re-indexed files whose old chunks must go first.
+            db.remove_files_chunks(list(batch))
+
+            metas: list[dict] = []
+            texts: list[str] = []
+            for path, event_type in batch.items():
+                if event_type == "deleted":
+                    continue
                 try:
-                    stat = os.stat(path)
-                    fsize = stat.st_size
-                    fmod = stat.st_mtime
+                    st = os.stat(path)
                 except OSError:
-                    fsize = 0
-                    fmod = 0.0
-                line_ranges = [(c[1], c[2]) for c in chunks_with_lines]
-                db.add_chunks(
-                    texts=texts,
-                    file_path=path,
-                    file_name=os.path.basename(path),
-                    file_hash=file_hash(path),
-                    vectors=vectors,
-                    timestamp=time.time(),
-                    file_ext=ext,
-                    file_size=fsize,
-                    file_modified=fmod,
-                    line_ranges=line_ranges,
-                )
+                    continue
+
+                text = extract_text(path)
+                if not text:
+                    continue
+                chunks = chunk_text_with_lines(text)
+                if not chunks:
+                    continue
+
+                fname = os.path.basename(path)
+                fhash = file_hash(path, st.st_size, st.st_mtime)
+                file_context = context_header(path, fname)
+                for idx, (chunk, line_start, line_end) in enumerate(chunks):
+                    texts.append(file_context + chunk)
+                    metas.append({
+                        "text": "",
+                        "file_path": path,
+                        "file_name": fname,
+                        "chunk_index": idx,
+                        "file_hash": fhash,
+                        "indexed_at": time.time(),
+                        "file_ext": Path(path).suffix.lower(),
+                        "file_size": st.st_size,
+                        "file_modified": st.st_mtime,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                    })
+
+            if texts:
+                vectors = embedder.get_embeddings(texts)
+                for meta, text in zip(metas, texts):
+                    meta["text"] = text
+                db.add_records_arrow(metas, vectors)
+                logger.info("Applied %d file changes (%d chunks)", len(batch), len(texts))
+        except Exception as e:
+            logger.warning("Failed to apply file changes: %s", e)
 
 
 # --- Request/Response models ---
 
 class SearchRequest(BaseModel):
     query: str
-    type: str = "semantic"
+    type: str = "all"  # "all" | "apps" | "files" | "content" | "actions"
     limit: int = 20
 
 class SearchResponse(BaseModel):
@@ -143,21 +191,116 @@ async def health():
     }
 
 
+# Shared executor for parallel search — 3 workers is enough for apps/files/semantic
+# Shared executor for high-speed parallel search
+_search_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="search")
+
+
+def _unified_omnisearch(query: str, limit: int = 20) -> list[dict]:
+    """High-speed omnichannel search aggregating Quick Actions/Math, Apps, Files, and Semantic Content.
+
+    Optimized Strategy:
+    1. Quick Math / System Actions execute synchronously in < 0.2ms.
+    2. Apps + In-Memory Files execute concurrently in < 25ms.
+    3. Early-Exit: If top match is strong (>= 0.85) on short query (e.g. app/file name),
+       return immediately without waiting for semantic search.
+    4. Semantic vector search is invoked only for multi-word or non-exact queries.
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    combined: list[dict] = []
+
+    # 1. Quick Math / System Actions — instant (<0.2ms)
+    quick_items = evaluate_quick_query(q)
+    if quick_items:
+        if any(it.get("category") == "calc" for it in quick_items):
+            return quick_items[:limit]
+        combined.extend(quick_items)
+
+    # 2+3. Apps + Files in parallel
+    apps_future = _search_executor.submit(search_apps, q, 6)
+    files_future = _search_executor.submit(fuzzy_file_search, q, _current_folders, 15)
+
+    apps: list[dict] = []
+    files: list[dict] = []
+    try:
+        apps = apps_future.result(timeout=0.35)
+    except Exception as e:
+        logger.debug("App search error or timeout: %s", e)
+    try:
+        files = files_future.result(timeout=0.40)
+    except Exception as e:
+        logger.debug("File search error or timeout: %s", e)
+
+    combined.extend(apps)
+
+    # Deduplicate files that might be same as apps
+    app_targets = {a["filePath"].lower() for a in apps}
+    for f in files:
+        if f["filePath"].lower() not in app_targets:
+            combined.append(f)
+
+    # Sort fast results by score so top matches appear first
+    combined.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # 4. Early-Exit Optimization:
+    # If we have an exact/near-exact app or filename match on a 1-2 word query, return instantly!
+    best_fast_score = max((r.get("score", 0) for r in combined), default=0)
+    num_words = len(q.split())
+    is_short_query = num_words <= 2
+
+    if best_fast_score >= 0.85 and is_short_query:
+        return combined[:limit]
+
+    # 5. Semantic search for multi-word, descriptive, or unanswered queries
+    should_run_semantic = (
+        _model_ready.is_set()
+        and len(q) >= 3
+        and (best_fast_score < 0.85 or num_words >= 3)
+    )
+
+    if should_run_semantic:
+        try:
+            semantic_items = semantic_search(q, limit=6)
+            existing_paths = {c["filePath"].lower() for c in combined}
+            for s in semantic_items:
+                if s["filePath"].lower() not in existing_paths:
+                    combined.append(s)
+        except Exception as e:
+            logger.debug("Semantic search error in omnisearch: %s", e)
+
+    # Final sort so high scoring semantic matches or exact file matches are ranked correctly
+    combined.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return combined[:limit]
+
+
 @app.post("/search", response_model=SearchResponse)
-async def search_endpoint(req: SearchRequest):
-    if req.type == "files":
-        results = fuzzy_file_search(
-            req.query,
-            _current_folders,
-            limit=req.limit,
-            supported_extensions=SUPPORTED_EXTENSIONS,
-        )
-    elif req.type == "apps":
-        results = search_apps(req.query, limit=req.limit)
-    else:
+def search_endpoint(req: SearchRequest):
+    """Synchronous FastAPI handler executed in worker threadpool to prevent event-loop blocking."""
+    q = req.query.strip()
+    search_type = req.type.lower()
+
+    if not q:
+        return SearchResponse(results=[], query=req.query, type=req.type)
+
+    if search_type in ("all", "unified"):
+        results = _unified_omnisearch(q, limit=req.limit)
+    elif search_type == "apps":
+        results = search_apps(q, limit=req.limit)
+    elif search_type == "files":
+        results = fuzzy_file_search(q, _current_folders, limit=req.limit)
+    elif search_type in ("content", "semantic"):
         if not _model_ready.is_set():
-            return SearchResponse(results=[], query=req.query, type=req.type)
-        results = semantic_search(req.query, limit=req.limit)
+            results = fuzzy_file_search(q, _current_folders, limit=req.limit)
+        else:
+            results = semantic_search(q, limit=req.limit)
+    elif search_type == "actions":
+        results = evaluate_quick_query(q)
+    else:
+        results = _unified_omnisearch(q, limit=req.limit)
+
     return SearchResponse(results=results, query=req.query, type=req.type)
 
 
@@ -194,13 +337,79 @@ async def similar_endpoint(req: SimilarRequest):
 async def preview_endpoint(
     path: str = Query(...),
     line: int = Query(0),
-    context: int = Query(50),
+    context: int = Query(60),
 ):
-    """Return file content around a specific line for preview."""
+    """Return rich file preview data (images, code/text with line numbers, metadata) for PowerToys Peek style view."""
     p = Path(path)
     if not p.exists() or not p.is_file():
-        return {"content": "", "total_lines": 0, "start_line": 0}
+        return {"content": "", "total_lines": 0, "start_line": 0, "type": "unknown"}
 
+    ext = p.suffix.lower()
+    stat = p.stat()
+    file_size_bytes = stat.st_size
+    mtime = stat.st_mtime
+
+    # 1. Image Files
+    image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+    if ext in image_exts:
+        try:
+            import base64
+            mime = "image/svg+xml" if ext == ".svg" else f"image/{ext.lstrip('.')}"
+            if ext in (".jpg", ".jpeg"):
+                mime = "image/jpeg"
+            raw_bytes = p.read_bytes()
+            if len(raw_bytes) <= 15 * 1024 * 1024:  # Max 15MB preview
+                b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                return {
+                    "type": "image",
+                    "content": f"data:{mime};base64,{b64}",
+                    "file_ext": ext,
+                    "file_size": file_size_bytes,
+                    "modified": mtime,
+                    "total_lines": 0,
+                    "start_line": 0,
+                }
+        except Exception as e:
+            logger.error("Image preview error: %s", e)
+
+    # 2. PDF Files (PyMuPDF high-res page 1 render + text extraction)
+    if ext == ".pdf":
+        try:
+            import base64
+            import pymupdf
+            doc = pymupdf.open(str(p))
+            num_pages = len(doc)
+            pdf_image = None
+            if num_pages > 0:
+                page = doc[0]
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("png")
+                b64 = base64.b64encode(img_bytes).decode("utf-8")
+                pdf_image = f"data:image/png;base64,{b64}"
+
+            texts = []
+            for idx in range(min(num_pages, 10)):
+                t = doc[idx].get_text()
+                if t and t.strip():
+                    texts.append(f"--- [ Sayfa {idx + 1} / {num_pages} ] ---\n{t.strip()}")
+            doc.close()
+            full_text = "\n\n".join(texts).strip()
+
+            return {
+                "type": "pdf",
+                "content": full_text or "Bu PDF taranmış veya salt görsel içeriyor.",
+                "pdf_image": pdf_image,
+                "page_count": num_pages,
+                "total_lines": len(full_text.splitlines()) if full_text else 0,
+                "start_line": 1,
+                "file_ext": ext,
+                "file_size": file_size_bytes,
+                "modified": mtime,
+            }
+        except Exception as e:
+            logger.warning("PyMuPDF preview fallback for %s: %s", path, e)
+
+    # 3. Text & Document Files
     try:
         text = extract_text(path)
         if not text:
@@ -212,7 +421,15 @@ async def preview_endpoint(
                     continue
 
         if not text:
-            return {"content": "", "total_lines": 0, "start_line": 0}
+            return {
+                "type": "binary",
+                "content": "",
+                "total_lines": 0,
+                "start_line": 0,
+                "file_ext": ext,
+                "file_size": file_size_bytes,
+                "modified": mtime,
+            }
 
         lines = text.split("\n")
         total = len(lines)
@@ -222,18 +439,29 @@ async def preview_endpoint(
             end = min(total, start + context)
         else:
             start = 0
-            end = min(total, 200)
+            end = min(total, 350)
 
         content = "\n".join(lines[start:end])
         return {
+            "type": "text",
             "content": content,
             "total_lines": total,
             "start_line": start + 1,
-            "file_ext": p.suffix.lower(),
+            "file_ext": ext,
+            "file_size": file_size_bytes,
+            "modified": mtime,
         }
     except Exception as e:
         logger.error("Preview error: %s", e)
-        return {"content": "", "total_lines": 0, "start_line": 0}
+        return {
+            "type": "unknown",
+            "content": "",
+            "total_lines": 0,
+            "start_line": 0,
+            "file_ext": ext,
+            "file_size": file_size_bytes,
+            "modified": mtime,
+        }
 
 
 @app.post("/index/start")
@@ -320,6 +548,53 @@ async def stop_indexing():
     return {"status": "stopping"}
 
 
+class EngineSettingsRequest(BaseModel):
+    ocr: bool | None = None
+    quantize: bool | None = None
+
+
+@app.get("/engine/settings")
+async def get_engine_settings():
+    data = engine_settings.load()
+    data["indexing"] = bool(_index_thread and _index_thread.is_alive())
+    return data
+
+
+@app.post("/engine/settings")
+async def set_engine_settings(req: EngineSettingsRequest):
+    """Update engine settings and report what the change costs.
+
+    Turning quantization on or off moves every vector to a different space, so
+    the index has to be rebuilt; enabling OCR only means images that were
+    skipped can now be read, which is a rebuild worth suggesting but not forcing.
+    """
+    before = engine_settings.load()
+    changes = {k: v for k, v in req.model_dump().items() if v is not None}
+    after = engine_settings.update(changes)
+
+    quantize_changed = before.get("quantize") != after.get("quantize")
+    ocr_changed = before.get("ocr") != after.get("ocr")
+
+    if quantize_changed:
+        def _swap_model():
+            try:
+                embedder.reload_model()
+                # Record the new vector space now. Without this the startup
+                # migration check would see a stale marker on the next launch
+                # and silently drop the index the user just rebuilt.
+                _write_model_marker()
+                logger.info("Embedding model reloaded (%s)", embedder.model_signature())
+            except Exception as e:
+                logger.error("Model reload failed: %s", e)
+        threading.Thread(target=_swap_model, daemon=True).start()
+
+    return {
+        **after,
+        "rebuild_required": quantize_changed,
+        "rebuild_suggested": ocr_changed and after.get("ocr", False),
+    }
+
+
 @app.get("/index/folders")
 async def get_folders():
     return {"folders": _current_folders}
@@ -333,15 +608,62 @@ async def set_folders(req: FoldersRequest):
 
 
 def find_free_port() -> int:
+    env_port = os.environ.get("LOCALMIND_PORT")
+    if env_port:
+        try:
+            return int(env_port)
+        except ValueError:
+            pass
+    # Try default preferred port first for predictable dev/browser connection
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 56789))
+            return 56789
+    except OSError:
+        pass
+    # Fallback to any free ephemeral port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
+def _port_file_path() -> str:
+    return os.path.join(str(Path.home()), ".localmind", "sidecar.port")
+
+
+def _write_port_file(port: int) -> None:
+    try:
+        os.makedirs(os.path.join(str(Path.home()), ".localmind"), exist_ok=True)
+        with open(_port_file_path(), "w") as f:
+            f.write(str(port))
+    except Exception as e:
+        logger.debug("Failed to write sidecar.port file: %s", e)
+
+
+def _remove_port_file() -> None:
+    try:
+        p = _port_file_path()
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _model_marker_path() -> str:
+    return os.path.join(db.DB_DIR, ".model_name")
+
+
+def _write_model_marker() -> None:
+    """Record the vector space the stored index belongs to."""
+    os.makedirs(db.DB_DIR, exist_ok=True)
+    with open(_model_marker_path(), "w") as f:
+        f.write(embedder.model_signature())
+
+
 def _check_model_migration():
     """Drop DB if embedding model changed since last index."""
-    marker = os.path.join(db.DB_DIR, ".model_name")
-    current_model = embedder._model_name
+    marker = _model_marker_path()
+    current_model = embedder.model_signature()
     try:
         if os.path.exists(marker):
             with open(marker, "r") as f:
@@ -353,20 +675,39 @@ def _check_model_migration():
             if db.count_rows() > 0:
                 logger.warning("No model marker found but index exists, dropping for safety")
             else:
-                os.makedirs(db.DB_DIR, exist_ok=True)
-                with open(marker, "w") as f:
-                    f.write(current_model)
+                _write_model_marker()
                 return
         db.drop_all()
     except Exception as e:
         logger.error("Model migration check error: %s", e)
-    os.makedirs(db.DB_DIR, exist_ok=True)
-    with open(marker, "w") as f:
-        f.write(current_model)
+    _write_model_marker()
+
+
+def _prewarm_caches():
+    """Pre-populate file and app caches so first search is instant."""
+    try:
+        from app_launcher import _refresh_cache as refresh_apps
+        refresh_apps()
+        logger.info("App cache pre-warmed")
+    except Exception as e:
+        logger.warning("App cache pre-warm failed: %s", e)
+
+    try:
+        from file_search import refresh_file_cache, _get_default_system_folders
+        default_folders = _get_default_system_folders()
+        if default_folders:
+            refresh_file_cache(default_folders, force=True)
+            logger.info("File cache pre-warmed with %d locations", len(default_folders))
+    except Exception as e:
+        logger.warning("File cache pre-warm failed: %s", e)
 
 
 def main():
+    import atexit
     port = find_free_port()
+    _write_port_file(port)
+    atexit.register(_remove_port_file)
+
     print(f"PORT={port}", flush=True)
     logger.info("Starting LocalMind AI Engine on port %d", port)
 
@@ -377,12 +718,21 @@ def main():
     model_thread = threading.Thread(target=_load_model_background, daemon=True)
     model_thread.start()
 
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=port,
-        log_level="warning",
-    )
+    # Pre-warm file and app caches in background so first search is instant
+    prewarm_thread = threading.Thread(target=_prewarm_caches, daemon=True)
+    prewarm_thread.start()
+
+    threading.Thread(target=_change_worker, daemon=True, name="change-worker").start()
+
+    try:
+        uvicorn.run(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    finally:
+        _remove_port_file()
 
 
 if __name__ == "__main__":

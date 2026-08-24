@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+ai_engine/.venv/
+ai_engine/venv/
+
+# Build output
+dist/
+dist-ssr/
+build/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+
+# Python bytecode / caches
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Lockfiles (large, low signal for the model)
+package-lock.json
+Cargo.lock
+
+# Runtime / user data
+.localmind/
+*.lance
+*.lancedb/
+data/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Media / binaries not needed for code understanding
+*.exe
+*.dll
+*.pdb
+*.ico
+*.png
+*.jpg
+*.jpeg
+*.gif

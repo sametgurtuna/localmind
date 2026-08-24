@@ -50,3 +50,33 @@ Desktop.ini
 
 # App data
 app-icon.png
+
+# Claude Code
+.claude/
+.claude/settings.local.json
+CLAUDE.local.md
+.mcp.json
+
+# Runtime / user data (never ship with the app)
+.localmind/
+*.lance
+*.lancedb/
+data/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build artifacts
+build/
+*.exe
+*.dll
+*.pdb
+src-tauri/gen/
+
+# Secrets / keys
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/

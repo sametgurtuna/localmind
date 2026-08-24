@@ -77,6 +77,10 @@ export function addRecentFile(config: AppConfig, path: string, name: string): Ap
   return { ...config, recentFiles: recent };
 }
 
+export function clearRecentFiles(config: AppConfig): AppConfig {
+  return { ...config, recentFiles: [] };
+}
+
 export function togglePinnedFile(config: AppConfig, path: string, name: string): AppConfig {
   const exists = config.pinnedFiles.some((p) => p.path === path);
   if (exists) {

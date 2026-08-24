@@ -2,9 +2,196 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::mft_index::{scan_all_drives_background, NativeSearchResult, SharedMftIndex};
 use crate::sidecar;
+
+#[tauri::command]
+pub fn fast_search_native(
+    app: tauri::AppHandle,
+    query: String,
+    filter_type: Option<String>,
+    limit: Option<usize>,
+) -> Vec<NativeSearchResult> {
+    if let Some(shared_index) = app.try_state::<SharedMftIndex>() {
+        if let Ok(index) = shared_index.read() {
+            let ftype = filter_type.unwrap_or_else(|| "all".to_string());
+            let lim = limit.unwrap_or(25);
+            return index.search(&query, &ftype, lim);
+        }
+    }
+    Vec::new()
+}
+
+#[tauri::command]
+pub fn get_mft_status(app: tauri::AppHandle) -> serde_json::Value {
+    if let Some(shared_index) = app.try_state::<SharedMftIndex>() {
+        if let Ok(index) = shared_index.read() {
+            return serde_json::json!({
+                "status": index.status,
+                "total_files": index.total_files,
+                "total_apps": index.apps.len(),
+                "scan_time_ms": index.scan_time_ms,
+                "volumes": index.volumes.iter().map(|v| format!("{}:\\", v.drive_letter)).collect::<Vec<_>>()
+            });
+        }
+    }
+    serde_json::json!({ "status": "unavailable", "total_files": 0, "total_apps": 0 })
+}
+
+#[tauri::command]
+pub fn refresh_mft_index(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(shared_index) = app.try_state::<SharedMftIndex>() {
+        scan_all_drives_background(shared_index.inner().clone());
+        return Ok(());
+    }
+    Err("MFT Index state not available".to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeFilePreview {
+    #[serde(rename = "type")]
+    pub preview_type: String, // "image" | "text" | "app" | "binary"
+    pub content: String,
+    pub total_lines: usize,
+    pub start_line: usize,
+    pub file_ext: String,
+    pub file_size: u64,
+    pub modified: Option<f64>,
+    pub icon: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_file_preview_native(path: String, line: Option<usize>, context: Option<usize>) -> NativeFilePreview {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return NativeFilePreview {
+            preview_type: "unknown".to_string(),
+            content: "".to_string(),
+            total_lines: 0,
+            start_line: 0,
+            file_ext: "".to_string(),
+            file_size: 0,
+            modified: None,
+            icon: None,
+        };
+    }
+
+    let meta = p.metadata().ok();
+    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs_f64())
+    });
+
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ext_with_dot = if ext.is_empty() { String::new() } else { format!(".{}", ext) };
+
+    // 1. Image Files
+    let image_exts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"];
+    if image_exts.contains(&ext.as_str()) {
+        if let Ok(bytes) = std::fs::read(p) {
+            if bytes.len() <= 20 * 1024 * 1024 {
+                let mime = match ext.as_str() {
+                    "svg" => "image/svg+xml",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "bmp" => "image/bmp",
+                    "ico" => "image/x-icon",
+                    _ => "image/png",
+                };
+                let b64 = crate::apps::base64_encode(&bytes);
+                return NativeFilePreview {
+                    preview_type: "image".to_string(),
+                    content: format!("data:{};base64,{}", mime, b64),
+                    total_lines: 0,
+                    start_line: 0,
+                    file_ext: ext_with_dot,
+                    file_size,
+                    modified,
+                    icon: None,
+                };
+            }
+        }
+    }
+
+    // 2. Apps (.exe / .lnk)
+    if ext == "exe" || ext == "lnk" {
+        let icon = crate::apps::extract_file_icon_base64(&path);
+        return NativeFilePreview {
+            preview_type: "app".to_string(),
+            content: "".to_string(),
+            total_lines: 0,
+            start_line: 0,
+            file_ext: ext_with_dot,
+            file_size,
+            modified,
+            icon,
+        };
+    }
+
+    // 3. PDF Files (delegate to PyMuPDF sidecar for high-res page render & full text extraction)
+    if ext == "pdf" {
+        return NativeFilePreview {
+            preview_type: "pdf_pending".to_string(),
+            content: "".to_string(),
+            total_lines: 0,
+            start_line: 0,
+            file_ext: ext_with_dot,
+            file_size,
+            modified,
+            icon: None,
+        };
+    }
+
+    // 4. Text & Code Files
+    if let Ok(bytes) = std::fs::read(p) {
+        // If file contains null bytes in first 1024 bytes, likely binary
+        let is_binary = bytes.iter().take(1024).any(|&b| b == 0);
+        if !is_binary {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len();
+
+            let target_line = line.unwrap_or(0);
+            let ctx = context.unwrap_or(80);
+
+            let (start, end) = if target_line > 0 {
+                let s = target_line.saturating_sub(ctx / 2);
+                let e = (s + ctx).min(total);
+                (s, e)
+            } else {
+                (0, total.min(400))
+            };
+
+            let slice = if start < total { &lines[start..end] } else { &[] };
+            return NativeFilePreview {
+                preview_type: "text".to_string(),
+                content: slice.join("\n"),
+                total_lines: total,
+                start_line: start + 1,
+                file_ext: ext_with_dot,
+                file_size,
+                modified,
+                icon: None,
+            };
+        }
+    }
+
+    NativeFilePreview {
+        preview_type: "binary".to_string(),
+        content: "".to_string(),
+        total_lines: 0,
+        start_line: 0,
+        file_ext: ext_with_dot,
+        file_size,
+        modified,
+        icon: None,
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -32,14 +219,33 @@ impl Default for AppConfig {
 fn get_default_folder_list() -> Vec<String> {
     let mut folders = Vec::new();
     if let Some(home) = dirs_next::home_dir() {
-        for name in &["Documents", "Downloads", "Desktop"] {
+        for name in &["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"] {
             let p = home.join(name);
             if p.exists() {
                 folders.push(p.to_string_lossy().to_string());
             }
         }
     }
+    // Check secondary drives (D:\, E:\, etc.)
+    for letter in b'D'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        if std::path::Path::new(&drive).exists() {
+            folders.push(drive);
+        }
+    }
     folders
+}
+
+#[tauri::command]
+pub fn get_system_drives() -> Vec<String> {
+    let mut drives = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        if std::path::Path::new(&drive).exists() {
+            drives.push(drive);
+        }
+    }
+    drives
 }
 
 #[tauri::command]
@@ -123,6 +329,56 @@ pub fn delete_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn launch_app(path: String) -> Result<(), String> {
+    if path.contains(":") && !path.contains("\\") && !path.contains("/") {
+        // Protocol handler like ms-settings: or calculator:
+        Command::new("cmd")
+            .args(["/C", "start", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to launch protocol: {}", e))?;
+        return Ok(());
+    }
+
+    open::that(&path).map_err(|e| format!("Failed to launch app: {}", e))
+}
+
+#[tauri::command]
+pub fn show_in_folder(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if p.exists() {
+        Command::new("explorer")
+            .args(["/select,", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to show in folder: {}", e))?;
+        return Ok(());
+    }
+    let folder = p.parent().unwrap_or(&p);
+    open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
+}
+
+#[tauri::command]
+pub fn run_as_admin(path: String) -> Result<(), String> {
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Start-Process -FilePath '{}' -Verb RunAs", path),
+        ])
+        .spawn()
+        .map_err(|e| format!("Failed to run as administrator: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn system_command(command: String) -> Result<(), String> {
+    Command::new("cmd")
+        .args(["/C", &command])
+        .spawn()
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn open_file_at_line(path: String, line: u32) -> Result<(), String> {
     let ext = PathBuf::from(&path)
         .extension()
@@ -188,12 +444,13 @@ fn find_main_py() -> Result<PathBuf, String> {
 
 #[tauri::command]
 pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
-    // Check if already running
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    // 1. Check if sidecar is already registered and healthy
     if let Some(port) = sidecar::get_sidecar_port(&app) {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap();
         if client
             .get(format!("http://127.0.0.1:{}/health", port))
             .send()
@@ -204,50 +461,89 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         }
     }
 
-    let main_py = find_main_py()?;
-    log::info!("Starting AI engine from {:?}", main_py);
+    // 2. Check if a sidecar is running from ~/.localmind/sidecar.port or default port
+    if let Some(home) = dirs_next::home_dir() {
+        let port_file = home.join(".localmind").join("sidecar.port");
+        if let Ok(content) = std::fs::read_to_string(&port_file) {
+            if let Ok(port) = content.trim().parse::<u16>() {
+                if client
+                    .get(format!("http://127.0.0.1:{}/health", port))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    sidecar::set_sidecar_port(&app, port);
+                    log::info!("Reconnected to existing AI engine on port {}", port);
+                    return Ok(port);
+                }
+            }
+        }
+    }
 
-    let mut child = Command::new("python")
-        .arg(&main_py)
+    let main_py = find_main_py()?;
+    let engine_dir = main_py.parent().unwrap_or(&main_py);
+    log::info!("Starting AI engine from {:?} (dir: {:?})", main_py, engine_dir);
+
+    let mut cmd = Command::new("python");
+    cmd.arg(&main_py)
+        .current_dir(engine_dir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start AI engine: {}", e))?;
 
     let pid = child.id();
     sidecar::set_sidecar_pid(&app, pid);
 
-    // Read PORT from stdout in a blocking way, but only read one line
     let stdout = child.stdout.take().ok_or("No stdout")?;
 
-    // Spawn a thread to read the port line, with a timeout
+    // Spawn a persistent thread to read port and continue consuming stdout
+    // until the child process exits so the pipe is never closed.
     let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
 
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
+        let mut port_sent = false;
+
         for line in reader.lines() {
             match line {
-                Ok(line) => {
-                    if line.starts_with("PORT=") {
-                        match line[5..].trim().parse::<u16>() {
+                Ok(line_str) => {
+                    log::debug!("[AI Engine stdout] {}", line_str);
+                    if !port_sent && line_str.starts_with("PORT=") {
+                        match line_str[5..].trim().parse::<u16>() {
                             Ok(port) => {
                                 let _ = tx.send(Ok(port));
-                                return;
+                                port_sent = true;
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(format!("Failed to parse port: {}", e)));
-                                return;
+                                port_sent = true;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Failed to read stdout: {}", e)));
-                    return;
+                    if !port_sent {
+                        let _ = tx.send(Err(format!("Failed to read stdout: {}", e)));
+                        port_sent = true;
+                    }
+                    break;
                 }
             }
         }
-        let _ = tx.send(Err("AI engine exited without reporting port".to_string()));
+
+        if !port_sent {
+            let _ = tx.send(Err("AI engine exited without reporting port".to_string()));
+        }
     });
 
     // Wait up to 30 seconds for port
@@ -260,11 +556,6 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
     log::info!("AI engine started on port {}", port);
 
     // Wait for server to respond to health check (up to 15 seconds)
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .unwrap();
-
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Ok(resp) = client
@@ -279,7 +570,6 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         }
     }
 
-    // Return port anyway - server might just be slow
     log::warn!("AI engine health check timed out, returning port anyway");
     Ok(port)
 }

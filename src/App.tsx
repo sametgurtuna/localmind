@@ -4,10 +4,12 @@ import { SearchBar } from "./components/SearchBar";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useTheme } from "./hooks/useTheme";
 import { useSidecar } from "./hooks/useSidecar";
+import { useEngineSettings } from "./hooks/useEngineSettings";
 import {
   loadConfig,
   saveConfig,
   addRecentFile,
+  clearRecentFiles,
   addSearchHistory,
   removeSearchHistory,
   clearSearchHistory,
@@ -35,6 +37,7 @@ export default function App() {
   const { i18n } = useTranslation();
   const { theme, toggleTheme, setTheme } = useTheme();
   const sidecar = useSidecar();
+  const { engine, updateEngine, clearRebuildNotice } = useEngineSettings(sidecar.port);
   const [view, setView] = useState<View>("search");
   const [config, setConfig] = useState<AppConfig>(() => loadConfig());
 
@@ -81,9 +84,10 @@ export default function App() {
           max_file_size: config.maxFileSize,
           exclude_patterns: config.excludePatterns,
         }),
+        signal: AbortSignal.timeout(6000),
       }).catch(() => {});
     }
-  }, [sidecar.connected, sidecar.modelReady, sidecar.port, config.indexedFolders, config.maxFileSize]);
+  }, [sidecar.connected, sidecar.modelReady, sidecar.port, config.indexedFolders, config.maxFileSize, config.excludePatterns]);
 
   const updateConfig = useCallback((partial: Partial<AppConfig>) => {
     setConfig((prev) => {
@@ -101,7 +105,11 @@ export default function App() {
       return next;
     });
     try {
-      await tauriInvoke("open_file", { path: filePath });
+      if (filePath.endsWith(".lnk") || filePath.endsWith(".exe") || (filePath.includes(":") && !filePath.includes("\\"))) {
+        await tauriInvoke("launch_app", { path: filePath });
+      } else {
+        await tauriInvoke("open_file", { path: filePath });
+      }
     } catch {
       window.open(`file://${filePath}`);
     }
@@ -109,11 +117,55 @@ export default function App() {
 
   const handleOpenFolder = useCallback(async (filePath: string) => {
     try {
-      await tauriInvoke("open_folder", { path: filePath });
+      await tauriInvoke("show_in_folder", { path: filePath });
     } catch {
-      const sep = filePath.includes("\\") ? "\\" : "/";
-      const folder = filePath.substring(0, filePath.lastIndexOf(sep));
-      window.open(`file://${folder}`);
+      try {
+        await tauriInvoke("open_folder", { path: filePath });
+      } catch {
+        const sep = filePath.includes("\\") ? "\\" : "/";
+        const folder = filePath.substring(0, filePath.lastIndexOf(sep));
+        window.open(`file://${folder}`);
+      }
+    }
+  }, []);
+
+  const handleOpenInVscode = useCallback(async (path: string) => {
+    try {
+      await tauriInvoke("open_in_vscode", { path });
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const handleOpenInTerminal = useCallback(async (path: string) => {
+    try {
+      await tauriInvoke("open_in_terminal", { path });
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const handleRunAsAdmin = useCallback(async (path: string) => {
+    try {
+      await tauriInvoke("run_as_admin", { path });
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const handleSystemCommand = useCallback(async (command: string) => {
+    try {
+      await tauriInvoke("system_command", { command });
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const handleDeleteFile = useCallback(async (path: string) => {
+    try {
+      await tauriInvoke("delete_file", { path });
+    } catch {
+      /* noop */
     }
   }, []);
 
@@ -131,6 +183,15 @@ export default function App() {
     } catch {
       /* noop */
     }
+  }, []);
+
+  const handleAddSpecificFolder = useCallback((folder: string) => {
+    setConfig((prev) => {
+      if (prev.indexedFolders.includes(folder)) return prev;
+      const next = { ...prev, indexedFolders: [...prev.indexedFolders, folder] };
+      saveConfig(next);
+      return next;
+    });
   }, []);
 
   const handleRemoveFolder = useCallback((folder: string) => {
@@ -157,6 +218,7 @@ export default function App() {
           max_file_size: config.maxFileSize,
           exclude_patterns: config.excludePatterns,
         }),
+        signal: AbortSignal.timeout(6000),
       });
     } catch { /* noop */ }
   }, [sidecar.port, config.indexedFolders, config.maxFileSize, config.excludePatterns]);
@@ -244,6 +306,14 @@ export default function App() {
     });
   }, []);
 
+  const handleRecentFilesClear = useCallback(() => {
+    setConfig((prev) => {
+      const next = clearRecentFiles(prev);
+      saveConfig(next);
+      return next;
+    });
+  }, []);
+
   const handleTogglePin = useCallback((path: string, name: string) => {
     setConfig((prev) => {
       const next = togglePinnedFile(prev, path, name);
@@ -253,12 +323,17 @@ export default function App() {
   }, []);
 
   return (
-    <div className="w-full h-full flex items-start justify-center pt-[15vh]" style={{ background: "transparent" }}>
+    <div className="w-full h-full flex items-start justify-center p-3 sm:p-4 overflow-hidden select-none bg-transparent">
       {view === "search" ? (
         <SearchBar
           onOpenSettings={() => setView("settings")}
           onOpenFile={handleOpenFile}
           onOpenFolder={handleOpenFolder}
+          onOpenInVscode={handleOpenInVscode}
+          onOpenInTerminal={handleOpenInTerminal}
+          onRunAsAdmin={handleRunAsAdmin}
+          onSystemCommand={handleSystemCommand}
+          onDeleteFile={handleDeleteFile}
           sidecarConnected={sidecar.connected}
           modelReady={sidecar.modelReady}
           sidecarLoading={sidecar.loading}
@@ -268,6 +343,7 @@ export default function App() {
           onAddSearchHistory={handleSearchHistoryAdd}
           onRemoveSearchHistory={handleSearchHistoryRemove}
           onClearSearchHistory={handleSearchHistoryClear}
+          onClearRecentFiles={handleRecentFilesClear}
           onTogglePin={handleTogglePin}
           config={config}
           sidecarPort={sidecar.port}
@@ -281,6 +357,7 @@ export default function App() {
           onShortcutChange={handleShortcutChange}
           folders={config.indexedFolders}
           onAddFolder={handleAddFolder}
+          onAddSpecificFolder={handleAddSpecificFolder}
           onRemoveFolder={handleRemoveFolder}
           onRebuildIndex={handleRebuildIndex}
           autostart={config.autostart}
@@ -292,6 +369,9 @@ export default function App() {
           excludePatterns={config.excludePatterns}
           onAddExcludePattern={handleAddExcludePattern}
           onRemoveExcludePattern={handleRemoveExcludePattern}
+          engine={engine}
+          onEngineChange={updateEngine}
+          onClearRebuildNotice={clearRebuildNotice}
           onBack={() => setView("search")}
         />
       )}
