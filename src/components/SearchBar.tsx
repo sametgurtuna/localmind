@@ -133,8 +133,28 @@ export function SearchBar({
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  // Focus input on initial mount
   useEffect(() => {
     inputRef.current?.focus();
+  }, []);
+
+  // Re-focus input every time the window is shown (Ctrl+Space toggle)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        const win = getCurrentWindow();
+        win.onFocusChanged(({ payload: focused }) => {
+          if (focused) {
+            // Small delay to ensure the window is fully visible
+            setTimeout(() => {
+              inputRef.current?.focus();
+            }, 50);
+          }
+        }).then((fn) => { unlisten = fn; });
+      })
+      .catch(() => {});
+    return () => { unlisten?.(); };
   }, []);
 
   const triggerSearch = useCallback(
@@ -323,6 +343,11 @@ export function SearchBar({
             setPreviewFile(null);
           } else if (inputValue) {
             handleClear();
+          } else {
+            // Input is already empty — hide the window
+            import("@tauri-apps/api/window")
+              .then(({ getCurrentWindow }) => getCurrentWindow().hide())
+              .catch(() => {});
           }
           break;
       }
