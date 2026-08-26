@@ -1,6 +1,6 @@
 [package]
 name = "localmind"
-version = "2.0.0"
+version = "2.0.2"
 description = "Local AI-powered file search"
 authors = ["LocalMind"]
 license = "MIT"

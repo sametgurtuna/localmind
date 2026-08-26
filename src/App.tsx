@@ -89,6 +89,22 @@ export default function App() {
     }
   }, [sidecar.connected, sidecar.modelReady, sidecar.port, config.indexedFolders, config.maxFileSize, config.excludePatterns]);
 
+  useEffect(() => {
+    // Sync autostart status with backend
+    tauriInvoke<boolean>("get_autostart")
+      .then((enabled) => {
+        if (typeof enabled === "boolean" && enabled !== config.autostart) {
+          updateConfig({ autostart: enabled });
+        }
+      })
+      .catch(() => {});
+
+    // Ensure saved shortcut is registered in backend
+    if (config.shortcut) {
+      tauriInvoke("update_global_shortcut", { shortcut: config.shortcut }).catch(() => {});
+    }
+  }, []);
+
   const updateConfig = useCallback((partial: Partial<AppConfig>) => {
     setConfig((prev) => {
       const next = { ...prev, ...partial };
@@ -224,26 +240,24 @@ export default function App() {
   }, [sidecar.port, config.indexedFolders, config.maxFileSize, config.excludePatterns]);
 
   const handleShortcutChange = useCallback(
-    (shortcut: string) => {
+    async (shortcut: string) => {
       updateConfig({ shortcut });
-      tauriInvoke("save_config", { config: { ...config, shortcut } }).catch(() => {});
+      try {
+        await tauriInvoke("update_global_shortcut", { shortcut });
+      } catch (err) {
+        console.error("Failed to update global shortcut:", err);
+      }
     },
-    [config, updateConfig],
+    [updateConfig],
   );
 
   const handleAutostartChange = useCallback(
     async (autostart: boolean) => {
       updateConfig({ autostart });
       try {
-        if (autostart) {
-          const { enable } = await import("@tauri-apps/plugin-autostart");
-          await enable();
-        } else {
-          const { disable } = await import("@tauri-apps/plugin-autostart");
-          await disable();
-        }
-      } catch {
-        /* noop */
+        await tauriInvoke("set_autostart", { enable: autostart });
+      } catch (err) {
+        console.error("Failed to update autostart setting:", err);
       }
     },
     [updateConfig],

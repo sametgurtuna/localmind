@@ -64,8 +64,9 @@
   "settings": {
     "title": "Settings",
     "shortcut": "Global Shortcut",
-    "shortcutDesc": "Press keys to set a new shortcut",
-    "pressKeys": "Press keys...",
+    "shortcutDesc": "Click and press new keys to change shortcut (e.g. Ctrl+Space, Alt+Space)",
+    "shortcutReset": "Reset to default (Ctrl+Space)",
+    "pressKeys": "Press new keys (Esc to cancel)...",
     "theme": "Theme",
     "themeDark": "Dark",
     "themeLight": "Light",

@@ -64,8 +64,9 @@
   "settings": {
     "title": "Ayarlar",
     "shortcut": "Global Kısayol",
-    "shortcutDesc": "Yeni kısayol için tuşlara basın",
-    "pressKeys": "Tuşlara basın...",
+    "shortcutDesc": "Kısayolu değiştirmek için tıklayın ve yeni tuşlara basın (örn. Ctrl+Space, Alt+Space)",
+    "shortcutReset": "Varsayılana Sıfırla (Ctrl+Space)",
+    "pressKeys": "Yeni tuşlara basın (İptal için Esc)...",
     "theme": "Tema",
     "themeDark": "Koyu",
     "themeLight": "Açık",

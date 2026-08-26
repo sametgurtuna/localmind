@@ -1,11 +1,12 @@
 {
   "name": "localmind",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.0.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:sidecar": "python ai_engine/build.py",
     "preview": "vite preview",
     "tauri": "tauri"
   },

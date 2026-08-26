@@ -284,13 +284,180 @@ pub async fn rebuild_index(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_config() -> AppConfig {
+pub fn get_config_file_path(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(config_dir) = app.path().app_config_dir() {
+        let _ = std::fs::create_dir_all(&config_dir);
+        return config_dir.join("config.json");
+    }
+    if let Some(home) = dirs_next::config_dir() {
+        let p = home.join("LocalMind");
+        let _ = std::fs::create_dir_all(&p);
+        return p.join("config.json");
+    }
+    PathBuf::from("config.json")
+}
+
+pub fn load_app_config(app: &tauri::AppHandle) -> AppConfig {
+    let path = get_config_file_path(app);
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&data) {
+                return cfg;
+            }
+        }
+    }
     AppConfig::default()
 }
 
+pub fn save_app_config_to_disk(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), String> {
+    let path = get_config_file_path(app);
+    let data = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    std::fs::write(&path, data)
+        .map_err(|e| format!("Failed to write config file: {}", e))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn enable_windows_autostart(app_name: &str, app_path: &str, args: &[&str]) -> Result<(), String> {
+    let mut cmd_str = format!("\"{}\"", app_path);
+    for arg in args {
+        cmd_str.push_str(&format!(" {}", arg));
+    }
+
+    let output = Command::new("reg")
+        .args([
+            "add",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            app_name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &cmd_str,
+            "/f",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run reg add: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to enable autostart in registry: {}", err));
+    }
+    log::info!("Windows autostart enabled for {}: {}", app_name, cmd_str);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn disable_windows_autostart(app_name: &str) -> Result<(), String> {
+    let _ = Command::new("reg")
+        .args([
+            "delete",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            app_name,
+            "/f",
+        ])
+        .output();
+    log::info!("Windows autostart disabled for {}", app_name);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn is_windows_autostart_enabled(app_name: &str) -> bool {
+    let output = Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            app_name,
+        ])
+        .output();
+
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
 #[tauri::command]
-pub fn save_config(_config: AppConfig) -> Result<(), String> {
+pub fn update_global_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<String, String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+
+    let trimmed = shortcut.trim();
+    if trimmed.is_empty() {
+        return Err("Shortcut cannot be empty".to_string());
+    }
+
+    let parsed_sc: Shortcut = trimmed
+        .parse()
+        .map_err(|e| format!("Invalid shortcut format '{}': {:?}", trimmed, e))?;
+
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+
+    gs.register(parsed_sc)
+        .map_err(|e| format!("Failed to register hotkey '{}': {}", trimmed, e))?;
+
+    let mut config = load_app_config(&app);
+    config.shortcut = trimmed.to_string();
+    let _ = save_app_config_to_disk(&app, &config);
+
+    log::info!("Global shortcut updated to: {}", trimmed);
+    Ok(trimmed.to_string())
+}
+
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enable: bool) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("Could not determine executable path: {}", e))?;
+        let exe_str = exe_path.to_string_lossy();
+
+        if enable {
+            enable_windows_autostart("LocalMind", &exe_str, &["--minimized", "--autostart"])?;
+        } else {
+            disable_windows_autostart("LocalMind")?;
+        }
+    }
+
+    let mut config = load_app_config(&app);
+    config.autostart = enable;
+    let _ = save_app_config_to_disk(&app, &config);
+
+    Ok(enable)
+}
+
+#[tauri::command]
+pub fn get_autostart(_app: tauri::AppHandle) -> bool {
+    #[cfg(windows)]
+    {
+        is_windows_autostart_enabled("LocalMind")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+pub fn get_config(app: tauri::AppHandle) -> AppConfig {
+    load_app_config(&app)
+}
+
+#[tauri::command]
+pub fn save_config(app: tauri::AppHandle, config: AppConfig) -> Result<(), String> {
+    let _ = save_app_config_to_disk(&app, &config);
+
+    // Sync shortcut
+    if !config.shortcut.trim().is_empty() {
+        let _ = update_global_shortcut(app.clone(), config.shortcut.clone());
+    }
+
+    // Sync autostart
+    let _ = set_autostart(app, config.autostart);
+
     Ok(())
 }
 
@@ -410,6 +577,55 @@ pub fn get_sidecar_port(app: tauri::AppHandle) -> Option<u16> {
     sidecar::get_sidecar_port(&app)
 }
 
+fn find_sidecar_executable(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let target_triple = if cfg!(target_arch = "x86_64") {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+
+    let mut candidates = Vec::new();
+
+    // 1. Next to current running executable (standard production installer location)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("localmind-ai.exe"));
+            candidates.push(dir.join(format!("localmind-ai-{}.exe", target_triple)));
+            candidates.push(dir.join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+            candidates.push(dir.join("resources").join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+            candidates.push(dir.join("resources").join("localmind-ai.exe"));
+        }
+    }
+
+    // 2. Tauri resource directory
+    if let Ok(res_dir) = app.path().resource_dir() {
+        candidates.push(res_dir.join("localmind-ai.exe"));
+        candidates.push(res_dir.join(format!("localmind-ai-{}.exe", target_triple)));
+        candidates.push(res_dir.join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+    }
+
+    // 3. Project working directory (e.g. during local dev / test)
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("src-tauri").join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+        candidates.push(cwd.join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+        candidates.push(cwd.join("localmind-ai.exe"));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join("src-tauri").join("binaries").join(format!("localmind-ai-{}.exe", target_triple)));
+        }
+    }
+
+    for path in candidates {
+        if path.exists() && path.is_file() {
+            log::info!("Found AI engine sidecar executable: {:?}", path);
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn find_main_py() -> Result<PathBuf, String> {
     // Try relative to current working directory
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -480,14 +696,22 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         }
     }
 
-    let main_py = find_main_py()?;
-    let engine_dir = main_py.parent().unwrap_or(&main_py);
-    log::info!("Starting AI engine from {:?} (dir: {:?})", main_py, engine_dir);
+    let mut cmd = if let Some(sidecar_exe) = find_sidecar_executable(&app) {
+        let engine_dir = sidecar_exe.parent().unwrap_or(&sidecar_exe);
+        log::info!("Starting AI engine sidecar binary from {:?} (dir: {:?})", sidecar_exe, engine_dir);
+        let mut c = Command::new(&sidecar_exe);
+        c.current_dir(engine_dir);
+        c
+    } else {
+        let main_py = find_main_py()?;
+        let engine_dir = main_py.parent().unwrap_or(&main_py);
+        log::info!("Starting AI engine from Python script {:?} (dir: {:?})", main_py, engine_dir);
+        let mut c = Command::new("python");
+        c.arg(&main_py).current_dir(engine_dir);
+        c
+    };
 
-    let mut cmd = Command::new("python");
-    cmd.arg(&main_py)
-        .current_dir(engine_dir)
-        .stdout(std::process::Stdio::piped())
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 
     #[cfg(target_os = "windows")]

@@ -36,6 +36,70 @@ def build():
     target_triple = get_target_triple()
     output_name = f"localmind-ai-{target_triple}"
 
+    collect_packages = [
+        "uvicorn",
+        "fastapi",
+        "lancedb",
+        "pyarrow",
+        "sentence_transformers",
+        "tokenizers",
+        "onnxruntime",
+        "rapidfuzz",
+        "watchdog",
+        "openpyxl",
+        "docx",
+        "pptx",
+        "pymupdf",
+        "fitz",
+        "pypdf",
+        "pydantic",
+    ]
+
+    copy_metadata = [
+        "tqdm",
+        "regex",
+        "requests",
+        "packaging",
+        "filelock",
+        "numpy",
+        "huggingface-hub",
+        "safetensors",
+        "sentence-transformers",
+        "tokenizers",
+        "onnxruntime",
+        "fastapi",
+        "uvicorn",
+        "lancedb",
+        "pyarrow",
+    ]
+
+    hidden_imports = [
+        "uvicorn.logging",
+        "uvicorn.loops",
+        "uvicorn.loops.auto",
+        "uvicorn.protocols",
+        "uvicorn.protocols.http",
+        "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.websockets",
+        "uvicorn.protocols.websockets.auto",
+        "uvicorn.lifespan",
+        "uvicorn.lifespan.on",
+        "uvicorn.lifespan.off",
+        "winsearch",
+        "app_launcher",
+        "chunker",
+        "db",
+        "embedder",
+        "evaluator",
+        "extractor",
+        "file_search",
+        "indexer",
+        "query_parser",
+        "search",
+        "settings",
+        "watcher",
+    ]
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -45,13 +109,26 @@ def build():
         "--specpath", os.path.join(script_dir, "build"),
         "--clean",
         "--noconfirm",
-        main_path,
     ]
+
+    for pkg in collect_packages:
+        cmd.extend(["--collect-all", pkg])
+
+    for meta in copy_metadata:
+        cmd.extend(["--copy-metadata", meta])
+
+    for hi in hidden_imports:
+        cmd.extend(["--hidden-import", hi])
+
+    cmd.append(main_path)
 
     print(f"Building sidecar: {output_name}")
     print(f"Command: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
-    print(f"Build complete: {os.path.join(dist_dir, output_name)}")
+
+    exe_suffix = ".exe" if platform.system().lower() == "windows" else ""
+    built_path = os.path.join(dist_dir, f"{output_name}{exe_suffix}")
+    print(f"Build complete: {built_path}")
 
 
 if __name__ == "__main__":
