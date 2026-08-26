@@ -75,10 +75,10 @@ class FileIndex:
         return out
 
 
-# Hard ceiling on cached entries so a huge drive cannot grow the index without bound.
-MAX_CACHE_ENTRIES = int(os.environ.get("LOCALMIND_MAX_FILE_CACHE", "300000"))
+# Hard ceiling on cached entries for Python file fallback (Rust MFT handles whole drives)
+MAX_CACHE_ENTRIES = int(os.environ.get("LOCALMIND_MAX_FILE_CACHE", "10000"))
 # Upper bound on candidates examined per query token.
-MAX_CANDIDATES = 4000
+MAX_CANDIDATES = 1000
 
 _file_index = FileIndex()
 _cache_folders: list[str] = []

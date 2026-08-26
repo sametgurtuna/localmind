@@ -19,10 +19,15 @@ SETTINGS_PATH = os.path.join(str(Path.home()), ".localmind", "engine.json")
 DEFAULTS: dict = {
     # OCR costs ~500MB of models and seconds per image; off unless asked for.
     "ocr": False,
-    # int8 dynamic quantization: about 2x faster indexing, slightly different
-    # embeddings. Switching it invalidates the index.
-    "quantize": False,
+    # int8 dynamic quantization. None means "decide from the hardware": int8 is
+    # both faster and lighter on a CPU-only machine, but on a DirectX 12 GPU it
+    # trades throughput for memory, so that choice belongs to the user. See
+    # embedder.quantize_enabled. Switching it invalidates the index.
+    "quantize": None,
 }
+
+# Settings that accept None ("let the engine decide") as well as a bool.
+TRISTATE = frozenset({"quantize"})
 
 _lock = threading.Lock()
 _cache: dict | None = None
@@ -35,6 +40,8 @@ def _env_override(key: str, value):
     raw = os.environ.get(env_name)
     if raw is None:
         return value
+    if key in TRISTATE and raw.lower() in ("auto", ""):
+        return None
     return raw.lower() in ("1", "true", "yes")
 
 
@@ -72,7 +79,9 @@ def update(changes: dict) -> dict:
     applied = dict(current)
     for k, v in changes.items():
         if k in DEFAULTS:
-            applied[k] = bool(v)
+            # None is a real value for tri-state keys ("let the engine decide"),
+            # so it must not be coerced to False.
+            applied[k] = None if (v is None and k in TRISTATE) else bool(v)
 
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
     tmp = SETTINGS_PATH + ".tmp"

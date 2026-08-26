@@ -41,9 +41,12 @@ def build():
         "fastapi",
         "lancedb",
         "pyarrow",
-        "sentence_transformers",
         "tokenizers",
         "onnxruntime",
+        # onnx (and its protobuf dependency) is what onnxruntime.quantization
+        # needs for the one-off int8 conversion. Without it the packaged build
+        # silently falls back to the 449MB fp32 weights.
+        "onnx",
         "rapidfuzz",
         "watchdog",
         "openpyxl",
@@ -64,13 +67,31 @@ def build():
         "numpy",
         "huggingface-hub",
         "safetensors",
-        "sentence-transformers",
         "tokenizers",
         "onnxruntime",
+        "onnx",
         "fastapi",
         "uvicorn",
         "lancedb",
         "pyarrow",
+    ]
+
+    exclude_modules = [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "scipy",
+        "matplotlib",
+        "pandas",
+        "IPython",
+        "jupyter",
+        "transformers",
+        "sentence_transformers",
+        "tensorboard",
+        "caffe2",
+        "tkinter",
+        "test",
+        "unittest",
     ]
 
     hidden_imports = [
@@ -85,6 +106,7 @@ def build():
         "uvicorn.lifespan",
         "uvicorn.lifespan.on",
         "uvicorn.lifespan.off",
+        "onnxruntime.quantization",
         "winsearch",
         "app_launcher",
         "chunker",
@@ -116,6 +138,9 @@ def build():
 
     for meta in copy_metadata:
         cmd.extend(["--copy-metadata", meta])
+
+    for exc in exclude_modules:
+        cmd.extend(["--exclude-module", exc])
 
     for hi in hidden_imports:
         cmd.extend(["--hidden-import", hi])

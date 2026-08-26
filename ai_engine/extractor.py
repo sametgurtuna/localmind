@@ -105,12 +105,30 @@ def extract_text(file_path: str, max_size_mb: float = 50) -> str | None:
 
 
 def _read_plain_text(path: Path) -> str | None:
-    for encoding in ("utf-8", "latin-1", "cp1252", "utf-16"):
-        try:
-            text = path.read_text(encoding=encoding)
-            return text.strip() if text.strip() else None
-        except (UnicodeDecodeError, ValueError):
-            continue
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        if size > 64 * 1024:
+            # Memory-mapped read for larger files avoids redundant full-buffer copies
+            import mmap
+            with open(path, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    for enc in ("utf-8", "latin-1", "cp1252", "utf-16"):
+                        try:
+                            return mm.read().decode(enc).strip() or None
+                        except (UnicodeDecodeError, ValueError):
+                            mm.seek(0)
+                            continue
+        else:
+            for encoding in ("utf-8", "latin-1", "cp1252", "utf-16"):
+                try:
+                    text = path.read_text(encoding=encoding)
+                    return text.strip() if text.strip() else None
+                except (UnicodeDecodeError, ValueError):
+                    continue
+    except Exception:
+        pass
     return None
 
 
@@ -133,8 +151,9 @@ def _read_epub(path: Path) -> str | None:
 
 
 def _read_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> str | None:
-    """Extract PDF text using C++ PyMuPDF (fitz) with sub-millisecond page parsing."""
+    """Extract PDF text using C++ PyMuPDF with instant C-heap glyph/pixmap cache shrinking."""
     # 1. Ultra-fast PyMuPDF (MuPDF C++ engine)
+    doc = None
     try:
         import pymupdf
         doc = pymupdf.open(str(path))
@@ -145,14 +164,25 @@ def _read_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> str | None:
             t = page.get_text()
             if t and t.strip():
                 texts.append(t.strip())
-        doc.close()
         combined = "\n\n".join(texts).strip()
         if combined:
             return combined
     except Exception as e:
         logger.debug("PyMuPDF extraction fallback for %s: %s", path, e)
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        try:
+            import pymupdf
+            pymupdf.fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
 
     # 2. Fallback to pypdfium2 C++ parser
+    pdf = None
     try:
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(str(path))
@@ -164,19 +194,24 @@ def _read_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> str | None:
             text = textpage.get_text_range()
             if text and text.strip():
                 texts.append(text.strip())
-        pdf.close()
         combined = "\n\n".join(texts).strip()
         if combined:
             return combined
     except Exception as e:
         logger.debug("pypdfium2 extraction fallback for %s: %s", path, e)
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
 
-    # 2. Fallback to pdfplumber if pypdfium2 had an issue
+    # 3. Fallback to pdfplumber if needed
     try:
         import pdfplumber
         texts = []
-        with pdfplumber.open(path) as pdf:
-            for i, page in enumerate(pdf.pages):
+        with pdfplumber.open(path) as pdf_plumb:
+            for i, page in enumerate(pdf_plumb.pages):
                 if i >= max_pages:
                     break
                 try:
@@ -185,32 +220,50 @@ def _read_pdf(path: Path, max_pages: int = MAX_PDF_PAGES) -> str | None:
                         texts.append(text)
                 finally:
                     page.flush_cache()
-                    page.get_textmap.cache_clear()
+                    try:
+                        page.get_textmap.cache_clear()
+                    except Exception:
+                        pass
         combined = "\n".join(texts).strip()
         if combined:
             return combined
     except Exception:
         pass
 
-    # 3. Fallback: OCR only when explicitly enabled (scanned PDFs)
+    # 4. Fallback: OCR only when explicitly enabled (scanned PDFs)
     if ocr_enabled():
         return _read_image_ocr(path)
     return None
 
 
 def _read_docx(path: Path) -> str | None:
+    """Extract text from .docx via zero-overhead zipfile XML streaming (no heavy lxml DOM)."""
+    try:
+        import xml.etree.ElementTree as ET
+        with zipfile.ZipFile(path, "r") as z:
+            if "word/document.xml" in z.namelist():
+                with z.open("word/document.xml") as xml_f:
+                    tree = ET.parse(xml_f)
+                    root = tree.getroot()
+                    texts = [node.text for node in root.iter() if node.tag.endswith("}t") and node.text]
+                    if texts:
+                        return " ".join(texts).strip()
+    except Exception:
+        pass
+
+    # Fallback to python-docx
     try:
         from docx import Document
         doc = Document(str(path))
         texts = [p.text for p in doc.paragraphs if p.text.strip()]
-        combined = "\n".join(texts).strip()
-        return combined if combined else None
+        return "\n".join(texts).strip() if texts else None
     except Exception as e:
         logger.debug("docx extraction failed for %s: %s", path, e)
         return None
 
 
 def _read_xlsx(path: Path) -> str | None:
+    wb = None
     try:
         from openpyxl import load_workbook
 
@@ -223,15 +276,43 @@ def _read_xlsx(path: Path) -> str | None:
                 row_text = " | ".join(str(cell) for cell in row if cell is not None)
                 if row_text.strip():
                     texts.append(row_text)
-        wb.close()
         combined = "\n".join(texts).strip()
         return combined if combined else None
     except ImportError:
         logger.debug("openpyxl not installed, skipping .xlsx")
         return None
+    except Exception as e:
+        logger.debug("xlsx extraction error for %s: %s", path, e)
+        return None
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
 
 
 def _read_pptx(path: Path) -> str | None:
+    """Extract text from .pptx via lightweight zipfile slide parsing."""
+    try:
+        import xml.etree.ElementTree as ET
+        texts = []
+        with zipfile.ZipFile(path, "r") as z:
+            slide_files = sorted([n for n in z.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")])
+            for slide_num, slide_name in enumerate(slide_files, 1):
+                with z.open(slide_name) as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    slide_texts = [node.text for node in root.iter() if node.tag.endswith("}t") and node.text and node.text.strip()]
+                    if slide_texts:
+                        texts.append(f"[Slide {slide_num}]")
+                        texts.extend(slide_texts)
+        if texts:
+            return "\n".join(texts).strip()
+    except Exception:
+        pass
+
+    # Fallback to python-pptx
     try:
         from pptx import Presentation
 

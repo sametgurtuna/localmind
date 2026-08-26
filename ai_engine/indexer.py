@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterator, NamedTuple, Optional
@@ -31,14 +32,24 @@ SKIP_DIRS = frozenset({
     "huggingface", "transformers",
 })
 
+_CPU = os.cpu_count() or 4
+
 # Files are extracted in parallel (mostly I/O plus C-level parsers) while the
-# main thread owns the embedding model.
-EXTRACT_WORKERS = int(os.environ.get("LOCALMIND_EXTRACT_WORKERS", "0")) or min(8, (os.cpu_count() or 4))
+# main thread owns the embedding model. The two compete for the same cores, so
+# extraction takes half of them and ONNX Runtime (see embedder.load_model)
+# takes the other half. Handing extraction every core, as before, meant the
+# threads spent their time preempting the model rather than feeding it.
+EXTRACT_WORKERS = int(os.environ.get("LOCALMIND_EXTRACT_WORKERS", "0")) or max(2, min(6, _CPU // 2))
 # How many files are held in flight at once. Bounds peak RAM: only this many
 # extracted documents exist in memory at any moment.
-WINDOW = int(os.environ.get("LOCALMIND_INDEX_WINDOW", "64"))
-# Chunks are embedded in batches of this size.
-BATCH_SIZE = int(os.environ.get("LOCALMIND_EMBED_BATCH", "128"))
+WINDOW = int(os.environ.get("LOCALMIND_INDEX_WINDOW", "24"))
+# Chunks handed to the embedder in one call. The embedder sorts them by length
+# and splits them into model batches internally, so a larger pool here gives it
+# more to group and wastes less padding.
+BATCH_SIZE = int(os.environ.get("LOCALMIND_EMBED_POOL", "128"))
+# Rows buffered before a LanceDB write. Each write creates a dataset fragment;
+# batching them keeps the fragment count (and the end-of-run compaction) small.
+DB_FLUSH_ROWS = int(os.environ.get("LOCALMIND_DB_FLUSH_ROWS", "1000"))
 # Guards against a single huge document monopolizing the run.
 MAX_TEXT_CHARS = int(os.environ.get("LOCALMIND_MAX_TEXT_CHARS", "500000"))
 MAX_CHUNKS_PER_FILE = int(os.environ.get("LOCALMIND_MAX_CHUNKS_PER_FILE", "200"))
@@ -160,15 +171,23 @@ def _walk(
             continue
 
 
-def scan_files(
+def iter_files(
     folders: list[str],
     max_size_mb: float = 50,
     exclude_patterns: list[str] | None = None,
-) -> list[FileEntry]:
+    seen: set[str] | None = None,
+) -> Iterator[FileEntry]:
+    """Yield candidate files across folders, skipping paths already yielded.
+
+    A generator rather than a list: on a re-index most files are unchanged, and
+    materializing a FileEntry for every one of them held hundreds of megabytes
+    of tuples and strings for the whole run. Callers that need the full path
+    set pass their own `seen`, which costs one string per file instead.
+    """
     max_bytes = int(max_size_mb * 1024 * 1024)
     excl = exclude_patterns or []
-    entries: list[FileEntry] = []
-    seen: set[str] = set()
+    if seen is None:
+        seen = set()
 
     for folder in folders:
         if not os.path.isdir(folder):
@@ -176,8 +195,16 @@ def scan_files(
         for entry in _walk(folder, max_bytes, excl):
             if entry.path not in seen:
                 seen.add(entry.path)
-                entries.append(entry)
-    return entries
+                yield entry
+
+
+def scan_files(
+    folders: list[str],
+    max_size_mb: float = 50,
+    exclude_patterns: list[str] | None = None,
+) -> list[FileEntry]:
+    """List form of `iter_files`, kept for callers that want the whole set."""
+    return list(iter_files(folders, max_size_mb, exclude_patterns))
 
 
 def _extract_one(entry: FileEntry, max_file_size: float) -> tuple[FileEntry, list[tuple[str, int, int]]]:
@@ -223,26 +250,31 @@ def index_files(
     state.status = "indexing"
     state._started_at = time.time()
 
+    writer = db.BulkWriter(DB_FLUSH_ROWS)
     try:
         logger.info("Scanning folders: %s", folders)
         t0 = time.time()
-        entries = scan_files(folders, max_file_size, exclude_patterns)
-        logger.info("Scanned %d candidate files in %.2fs", len(entries), time.time() - t0)
 
         # Decide what actually needs work before touching any file content.
+        # The scan streams, so only changed files and the bare path set are
+        # held; unchanged files cost one string each rather than a full entry.
         known = db.known_hashes()
+        present: set[str] = set()
         pending: list[tuple[FileEntry, str]] = []
-        for e in entries:
+        for e in iter_files(folders, max_file_size, exclude_patterns, present):
             fhash = file_hash(e.path, e.size, e.mtime)
             if known.get(e.path) == fhash:
                 continue
             pending.append((e, fhash))
 
+        total = len(present)
+        logger.info("Scanned %d candidate files in %.2fs", total, time.time() - t0)
+
         # Prioritize PDFs, Documents, and Notes first
         pending.sort(key=_file_priority)
 
-        state.total = len(entries)
-        state.skipped = len(entries) - len(pending)
+        state.total = total
+        state.skipped = total - len(pending)
         state.indexed = state.skipped
         logger.info("%d files changed, %d unchanged", len(pending), state.skipped)
 
@@ -250,71 +282,93 @@ def index_files(
         # in a handful of statements rather than one delete per file.
         stale = [e.path for e, _ in pending if e.path in known]
         if prune_missing:
-            present = {e.path for e in entries}
             stale.extend(p for p in known if p not in present)
         if stale:
             logger.info("Removing stale chunks for %d files", len(stale))
             db.remove_files_chunks(stale)
+        present.clear()
 
         batch_texts: list[str] = []
         batch_meta: list[dict] = []
-        chunk_counters: dict[str, int] = {}
-        wrote_anything = False
+        stopped = False
 
+        # Extraction runs continuously rather than in lockstep windows: as soon
+        # as one file's result is consumed, the next is submitted. The previous
+        # code drained a whole window before submitting the next, so every
+        # worker sat idle waiting on the slowest file in the window while the
+        # main thread embedded. At most WINDOW files are in flight, which is
+        # what bounds peak memory.
         with ThreadPoolExecutor(max_workers=EXTRACT_WORKERS, thread_name_prefix="extract") as pool:
-            for i in range(0, len(pending), WINDOW):
+            queue: deque = deque()
+            upcoming = iter(pending)
+
+            def submit_next() -> bool:
+                item = next(upcoming, None)
+                if item is None:
+                    return False
+                entry, fhash = item
+                queue.append((fhash, pool.submit(_extract_one, entry, max_file_size)))
+                return True
+
+            for _ in range(WINDOW):
+                if not submit_next():
+                    break
+
+            while queue:
                 if state._stop_requested:
-                    state.status = "idle"
-                    return
+                    stopped = True
+                    for _, fut in queue:
+                        fut.cancel()
+                    queue.clear()
+                    break
 
-                window = pending[i:i + WINDOW]
-                hashes = {e.path: h for e, h in window}
-                extracted = pool.map(
-                    lambda item: _extract_one(item[0], max_file_size),
-                    window,
-                )
+                fhash, future = queue.popleft()
+                entry, chunks = future.result()
+                submit_next()
 
-                for entry, chunks in extracted:
-                    state.current = entry.name
-                    state.indexed += 1
-                    _update_progress(state)
-                    if on_progress:
-                        on_progress(state.progress, state.indexed, state.total)
+                state.current = entry.name
+                state.indexed += 1
+                _update_progress(state)
+                if on_progress:
+                    on_progress(state.progress, state.indexed, state.total)
 
-                    if not chunks:
-                        continue
+                if not chunks:
+                    continue
 
-                    fhash = hashes[entry.path]
-                    file_context = context_header(entry.path, entry.name)
+                file_context = context_header(entry.path, entry.name)
+                for idx, (chunk, line_start, line_end) in enumerate(chunks):
+                    batch_texts.append(file_context + chunk)
+                    batch_meta.append({
+                        "text": "",  # filled in at flush time
+                        "file_path": entry.path,
+                        "file_name": entry.name,
+                        "chunk_index": idx,
+                        "file_hash": fhash,
+                        "file_ext": entry.ext,
+                        "file_size": entry.size,
+                        "file_modified": entry.mtime,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                    })
 
-                    for chunk, line_start, line_end in chunks:
-                        idx = chunk_counters.get(entry.path, 0)
-                        chunk_counters[entry.path] = idx + 1
-                        batch_texts.append(file_context + chunk)
-                        batch_meta.append({
-                            "text": "",  # filled in at flush time
-                            "file_path": entry.path,
-                            "file_name": entry.name,
-                            "chunk_index": idx,
-                            "file_hash": fhash,
-                            "file_ext": entry.ext,
-                            "file_size": entry.size,
-                            "file_modified": entry.mtime,
-                            "line_start": line_start,
-                            "line_end": line_end,
-                        })
-
-                    while len(batch_texts) >= BATCH_SIZE:
-                        _flush_batch(batch_texts[:BATCH_SIZE], batch_meta[:BATCH_SIZE])
-                        del batch_texts[:BATCH_SIZE]
-                        del batch_meta[:BATCH_SIZE]
-                        wrote_anything = True
+                while len(batch_texts) >= BATCH_SIZE:
+                    _flush_batch(batch_texts[:BATCH_SIZE], batch_meta[:BATCH_SIZE], writer)
+                    del batch_texts[:BATCH_SIZE]
+                    del batch_meta[:BATCH_SIZE]
 
         if batch_texts:
-            _flush_batch(batch_texts, batch_meta)
+            _flush_batch(batch_texts, batch_meta, writer)
             batch_texts.clear()
             batch_meta.clear()
-            wrote_anything = True
+
+        # Whatever was embedded before a stop still belongs in the index.
+        writer.flush()
+
+        if stopped:
+            state.status = "idle"
+            state.current = ""
+            _release_resources()
+            return
 
         state.status = "complete"
         state.progress = 100
@@ -325,9 +379,12 @@ def index_files(
             elapsed, state.total, state.skipped,
         )
 
-        if wrote_anything or stale:
+        if writer.written or stale:
             db.optimize()
 
+        # The run is over and the user is looking at the result, so the next
+        # /index/stats call recounts instead of serving the rate-limited rollup.
+        db.reset_stats_cache()
         _release_resources()
 
         try:
@@ -340,6 +397,10 @@ def index_files(
         logger.exception("Indexing error: %s", e)
         state.status = "error"
         state.error = str(e)
+        try:
+            writer.flush()
+        except Exception:
+            logger.debug("Could not flush pending rows after error")
         _release_resources()
 
 
@@ -356,6 +417,17 @@ def _update_progress(state: IndexState) -> None:
         state.eta_seconds = remaining / rate if rate > 0 else 0
 
 
+def _trim_working_set() -> None:
+    """Trigger OS-level memory working set trimming on Windows to drop unneeded pages."""
+    gc.collect()
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        except Exception:
+            pass
+
+
 def _release_resources() -> None:
     """Give back the memory the indexing run needed but searching does not."""
     try:
@@ -363,10 +435,16 @@ def _release_resources() -> None:
         release_ocr_reader()
     except Exception:
         pass
-    gc.collect()
+    # The path -> hash map is only consulted while indexing; on a large index
+    # it was the single biggest thing the idle process kept alive.
+    try:
+        db.release_hash_cache()
+    except Exception:
+        pass
+    _trim_working_set()
 
 
-def _flush_batch(texts: list[str], metas: list[dict]) -> None:
+def _flush_batch(texts: list[str], metas: list[dict], writer: "db.BulkWriter") -> None:
     if not texts:
         return
 
@@ -377,7 +455,7 @@ def _flush_batch(texts: list[str], metas: list[dict]) -> None:
         meta["text"] = text
         meta["indexed_at"] = timestamp
 
-    db.add_records_arrow(metas, np.asarray(vectors, dtype=np.float32))
+    writer.add(metas, np.asarray(vectors, dtype=np.float32))
 
 
 def rebuild_index(folders: list[str], max_file_size: float = 50, exclude_patterns: list[str] | None = None) -> None:

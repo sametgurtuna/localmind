@@ -80,8 +80,8 @@ pub fn relaunch_elevated() -> bool {
 pub fn ensure_elevated() {
     #[cfg(windows)]
     {
-        // Don't elevate on background autostart, minimized tray mode, or when explicitly requested --no-elevate
-        let skip_elevation = std::env::args().any(|arg| {
+        // Don't elevate on debug dev runs, background autostart, minimized tray mode, or when explicitly requested --no-elevate
+        let skip_elevation = cfg!(debug_assertions) || std::env::args().any(|arg| {
             arg == "--no-elevate" || arg == "--autostart" || arg == "--minimized"
         });
         if !skip_elevation && !is_elevated() {

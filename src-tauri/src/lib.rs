@@ -48,7 +48,14 @@ pub fn run() {
             tray::create_tray(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
+                #[cfg(not(debug_assertions))]
                 let _ = win.hide();
+                #[cfg(debug_assertions)]
+                {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                    let _ = win.center();
+                }
             }
 
             // Register saved global shortcut

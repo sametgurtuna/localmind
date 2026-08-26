@@ -33,14 +33,28 @@ pub struct NativeSearchResult {
     pub icon: Option<String>,
 }
 
+/// One MFT record, holding no heap allocations of its own.
+///
+/// This used to carry three `String`s -- `name`, `name_lower` and `ext` -- which
+/// cost ~150 bytes and three separate allocations per file. A full NTFS volume
+/// has one to two million records, so the index alone sat on 150-250MB of RAM
+/// and fragmented the allocator doing it. Names now live in `VolumeData::names`,
+/// a single arena per volume, and an entry is a fixed 32-byte slice reference
+/// into it. `ext` is derived on demand (`entry_ext`) rather than stored: it is
+/// always a suffix of the lowercased name.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct CompactFileEntry {
     pub frn: u64,
     pub parent_frn: u64,
-    pub name: String,
-    pub name_lower: String,
-    pub ext: String,
+    /// Byte offset into the volume's name arena.
+    pub name_off: u32,
+    /// Length of the display name; the lowercased form follows it.
+    pub name_len: u16,
+    /// Length of the lowercased name. Case folding is not length-preserving
+    /// outside ASCII (Turkish dotted capitals in particular), so it is stored
+    /// rather than assumed equal to `name_len`.
+    pub lower_len: u16,
     pub is_dir: bool,
     pub volume_idx: u8,
 }
@@ -51,8 +65,51 @@ pub struct VolumeData {
     pub drive_letter: char,
     pub journal_id: u64,
     pub next_usn: i64,
-    pub parent_map: HashMap<u64, (u64, String)>,
+    /// Directory FRN -> (parent FRN, name slice in `names`). Directory names are
+    /// already in the arena because directories are indexed as records too, so
+    /// this borrows them instead of cloning a `String` per folder.
+    pub parent_map: HashMap<u64, (u64, u32, u16)>,
     pub files: Vec<CompactFileEntry>,
+    /// Every name and lowercased name on this volume, concatenated.
+    pub names: String,
+}
+
+impl VolumeData {
+    /// Append a name and its lowercased form to the arena.
+    fn intern(&mut self, name: &str) -> (u32, u16, u16) {
+        let off = self.names.len() as u32;
+        let lower = name.to_lowercase();
+        self.names.push_str(name);
+        self.names.push_str(&lower);
+        (off, name.len() as u16, lower.len() as u16)
+    }
+
+    #[inline]
+    fn slice(&self, off: u32, len: u16) -> &str {
+        let start = off as usize;
+        &self.names[start..start + len as usize]
+    }
+
+    #[inline]
+    pub fn name(&self, e: &CompactFileEntry) -> &str {
+        self.slice(e.name_off, e.name_len)
+    }
+
+    #[inline]
+    pub fn name_lower(&self, e: &CompactFileEntry) -> &str {
+        let start = e.name_off as usize + e.name_len as usize;
+        &self.names[start..start + e.lower_len as usize]
+    }
+
+    /// Lowercased extension including the dot, or "" when the name has none.
+    #[inline]
+    pub fn ext(&self, e: &CompactFileEntry) -> &str {
+        let lower = self.name_lower(e);
+        match lower.rfind('.') {
+            Some(i) => &lower[i..],
+            None => "",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -89,11 +146,11 @@ impl MftIndex {
         let mut depth = 0;
 
         while curr_frn != 0 && depth < 32 {
-            if let Some((parent_id, folder_name)) = vol.parent_map.get(&curr_frn) {
-                if !folder_name.is_empty() {
-                    path_parts.push(folder_name.as_str());
+            if let Some(&(parent_id, off, len)) = vol.parent_map.get(&curr_frn) {
+                if len > 0 {
+                    path_parts.push(vol.slice(off, len));
                 }
-                curr_frn = *parent_id;
+                curr_frn = parent_id;
                 depth += 1;
             } else {
                 break;
@@ -181,13 +238,22 @@ impl MftIndex {
             let tokens_slice = q_tokens.as_slice();
             let num_tokens = tokens_slice.len();
 
+            // Keep only the best `cap` matches instead of collecting every hit.
+            // A one-letter query matches most of the volume, and materializing
+            // that whole list -- then sorting it -- cost tens of megabytes and
+            // the bulk of the query time for results nobody would ever see.
+            let cap = (limit * 4).max(64);
+            let by_score_desc = |a: &(usize, &CompactFileEntry, f64), b: &(usize, &CompactFileEntry, f64)| {
+                b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+            };
+
             let matched_files: Vec<(usize, &CompactFileEntry, f64)> = self
                 .volumes
                 .par_iter()
                 .enumerate()
                 .flat_map(|(vol_idx, vol)| {
                     vol.files.par_iter().filter_map(move |file| {
-                        let fname_lower = file.name_lower.as_str();
+                        let fname_lower = vol.name_lower(file);
                         let score = if fname_lower == q_str {
                             1.0
                         } else if fname_lower.starts_with(q_str) {
@@ -210,25 +276,40 @@ impl MftIndex {
                         }
                     })
                 })
-                .collect();
+                .fold(Vec::new, |mut acc, item| {
+                    acc.push(item);
+                    if acc.len() >= cap * 4 {
+                        acc.sort_unstable_by(by_score_desc);
+                        acc.truncate(cap);
+                    }
+                    acc
+                })
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    a.sort_unstable_by(by_score_desc);
+                    a.truncate(cap);
+                    a
+                });
 
-            // Collect and sort highest scoring files
             let mut scored = matched_files;
-            scored.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_unstable_by(by_score_desc);
 
             for (vol_idx, file, score) in scored.into_iter().take(limit * 2) {
-                let full_path = self.reconstruct_path(vol_idx, file.parent_frn, &file.name);
+                let vol = &self.volumes[vol_idx];
+                let name = vol.name(file);
+                let full_path = self.reconstruct_path(vol_idx, file.parent_frn, name);
+                let ext = vol.ext(file);
                 results.push(NativeSearchResult {
-                    file_name: file.name.clone(),
+                    file_name: name.to_string(),
                     file_path: full_path.clone(),
                     snippet: full_path,
                     score,
-                    file_ext: if file.ext.is_empty() { None } else { Some(file.ext.clone()) },
+                    file_ext: if ext.is_empty() { None } else { Some(ext.to_string()) },
                     file_size: None,
                     file_modified: None,
                     category: if file.is_dir { "folder".to_string() } else { "file".to_string() },
                     action: "open_file".to_string(),
-                    action_title: format!("Open {}", file.name),
+                    action_title: format!("Open {}", name),
                     icon: None,
                 });
 
@@ -423,40 +504,41 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
                             total_files += count;
                             log::info!("Volume {}:\\ scanned: {} files in {:?}", drive, count, start.elapsed());
 
-                            let mut parent_map = HashMap::with_capacity(count / 8);
-                            let mut files = Vec::with_capacity(count);
                             let vol_idx = volumes_data.len() as u8;
+                            let mut vol = VolumeData {
+                                drive_letter: drive,
+                                journal_id: scan_res.journal_id,
+                                next_usn: scan_res.next_usn,
+                                parent_map: HashMap::with_capacity(count / 8),
+                                files: Vec::with_capacity(count),
+                                // Names plus their lowercased forms, roughly
+                                // 40 bytes per record. Reserving up front keeps
+                                // the arena from being reallocated and copied
+                                // a dozen times while a volume is scanned.
+                                names: String::with_capacity(count * 40),
+                            };
 
                             for rec in scan_res.records {
+                                let (off, name_len, lower_len) = vol.intern(&rec.name);
                                 if rec.is_dir {
-                                    parent_map.insert(rec.frn, (rec.parent_frn, rec.name.clone()));
+                                    vol.parent_map.insert(rec.frn, (rec.parent_frn, off, name_len));
                                 }
-
-                                let name_lower = rec.name.to_lowercase();
-                                let ext = if let Some(dot_idx) = rec.name.rfind('.') {
-                                    rec.name[dot_idx..].to_lowercase()
-                                } else {
-                                    String::new()
-                                };
-
-                                files.push(CompactFileEntry {
+                                vol.files.push(CompactFileEntry {
                                     frn: rec.frn,
                                     parent_frn: rec.parent_frn,
-                                    name: rec.name,
-                                    name_lower,
-                                    ext,
+                                    name_off: off,
+                                    name_len,
+                                    lower_len,
                                     is_dir: rec.is_dir,
                                     volume_idx: vol_idx,
                                 });
                             }
 
-                            volumes_data.push(VolumeData {
-                                drive_letter: drive,
-                                journal_id: scan_res.journal_id,
-                                next_usn: scan_res.next_usn,
-                                parent_map,
-                                files,
-                            });
+                            // The arena is written once and read forever; hand
+                            // back whatever the capacity estimate overshot.
+                            vol.names.shrink_to_fit();
+                            vol.files.shrink_to_fit();
+                            volumes_data.push(vol);
                         }
                         Err(e) => {
                             log::warn!("MFT scan skipped for drive {}: {}", drive, e);
@@ -501,44 +583,41 @@ mod tests {
     #[test]
     fn test_mft_search_and_path_reconstruction() {
         let mut index = MftIndex::new();
-        let mut parent_map = HashMap::new();
-
-        // Simulate hierarchy: C:\Users\samet\Documents\invoice_2026.pdf
-        // FRN 1: Users (parent: 0)
-        parent_map.insert(1, (0, "Users".to_string()));
-        // FRN 2: samet (parent: 1)
-        parent_map.insert(2, (1, "samet".to_string()));
-        // FRN 3: Documents (parent: 2)
-        parent_map.insert(3, (2, "Documents".to_string()));
-
-        let files = vec![
-            CompactFileEntry {
-                frn: 100,
-                parent_frn: 3,
-                name: "invoice_2026.pdf".to_string(),
-                name_lower: "invoice_2026.pdf".to_string(),
-                ext: ".pdf".to_string(),
-                is_dir: false,
-                volume_idx: 0,
-            },
-            CompactFileEntry {
-                frn: 101,
-                parent_frn: 3,
-                name: "budget_report.xlsx".to_string(),
-                name_lower: "budget_report.xlsx".to_string(),
-                ext: ".xlsx".to_string(),
-                is_dir: false,
-                volume_idx: 0,
-            },
-        ];
-
-        index.volumes.push(VolumeData {
+        let mut vol = VolumeData {
             drive_letter: 'C',
             journal_id: 1,
             next_usn: 1000,
-            parent_map,
-            files,
-        });
+            ..Default::default()
+        };
+
+        // Simulate hierarchy: C:\Users\samet\Documents\invoice_2026.pdf
+        // Directories are interned like any other record; parent_map points at
+        // the arena slice rather than owning a copy of the name.
+        for (frn, parent, name) in [(1u64, 0u64, "Users"), (2, 1, "samet"), (3, 2, "Documents")] {
+            let (off, len, _) = vol.intern(name);
+            vol.parent_map.insert(frn, (parent, off, len));
+        }
+
+        for (frn, name) in [(100u64, "invoice_2026.pdf"), (101, "budget_report.xlsx")] {
+            let (off, name_len, lower_len) = vol.intern(name);
+            vol.files.push(CompactFileEntry {
+                frn,
+                parent_frn: 3,
+                name_off: off,
+                name_len,
+                lower_len,
+                is_dir: false,
+                volume_idx: 0,
+            });
+        }
+
+        // Names and extensions must read back correctly out of the arena.
+        assert_eq!(vol.name(&vol.files[0]), "invoice_2026.pdf");
+        assert_eq!(vol.name_lower(&vol.files[0]), "invoice_2026.pdf");
+        assert_eq!(vol.ext(&vol.files[0]), ".pdf");
+        assert_eq!(vol.ext(&vol.files[1]), ".xlsx");
+
+        index.volumes.push(vol);
 
         // Test path reconstruction
         let path = index.reconstruct_path(0, 3, "invoice_2026.pdf");
@@ -566,5 +645,50 @@ mod tests {
         assert!(fuzzy_match_score("chrm", "google chrome.lnk") > 0.70);
         assert!(fuzzy_match_score("vsc", "visual studio code") > 0.70);
         assert_eq!(fuzzy_match_score("xyz123", "spotify.exe"), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod footprint {
+    use super::*;
+
+    /// Documents what one indexed record costs. Not a behavioural test -- it
+    /// prints the figures the README quotes, so they can be re-checked.
+    #[test]
+    fn report_entry_footprint() {
+        // What the entry used to be: three owned Strings plus the scalars.
+        #[allow(dead_code)]
+        struct LegacyEntry {
+            frn: u64,
+            parent_frn: u64,
+            name: String,
+            name_lower: String,
+            ext: String,
+            is_dir: bool,
+            volume_idx: u8,
+        }
+
+        let legacy_struct = std::mem::size_of::<LegacyEntry>();
+        let now_struct = std::mem::size_of::<CompactFileEntry>();
+
+        // Average NTFS filename, and what each layout allocates for it.
+        let name = "quarterly_report_2026_final.pdf";
+        let heap_legacy = name.len() * 2 + 4; // name + lowercase + ".pdf"
+        let heap_now = name.len() * 2;        // one arena slice, shared buffer
+
+        let per_file_legacy = legacy_struct + heap_legacy;
+        let per_file_now = now_struct + heap_now;
+
+        println!("struct:    legacy {legacy_struct} B -> now {now_struct} B");
+        println!("per file:  legacy {per_file_legacy} B -> now {per_file_now} B");
+        println!("allocations per file: legacy 3 -> now 0");
+        for files in [500_000usize, 1_000_000, 2_000_000] {
+            let a = files * per_file_legacy / (1024 * 1024);
+            let b = files * per_file_now / (1024 * 1024);
+            println!("{files:>9} files: {a:>4} MB -> {b:>4} MB (saves {} MB)", a - b);
+        }
+
+        assert!(now_struct < legacy_struct);
+        assert!(per_file_now < per_file_legacy);
     }
 }

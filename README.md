@@ -56,7 +56,9 @@ v1 was a semantic search tool. **v2 is a full launcher, and it is dramatically f
 | **Preview** | Inline snippet | **Full split preview panel with syntax highlighting and metadata** |
 | **Extras** | None | **Calculator, unit and currency conversion, system actions, web search shortcuts** |
 | **Fallback** | None | **Windows Search Indexer fallback when running unelevated** |
-| **Engine control** | Fixed | **OCR toggle, int8 quantization for ~2x faster indexing** |
+| **Engine control** | Fixed | **OCR toggle, hardware aware int8 quantization** |
+| **Indexing throughput** | Baseline | **~1.6x faster end to end, on ~30% less peak memory** |
+| **Native index footprint** | 3 heap allocations per file | **Zero: names live in one arena per volume, ~65 MB less per million files** |
 
 Everything below is local. No account, no API key, no network call, no telemetry. Ever.
 
@@ -79,7 +81,7 @@ A Rust engine reads the **NTFS Master File Table** directly via `FSCTL_ENUM_USN_
 
 ### Real understanding
 
-A local Python sidecar chunks and embeds the text inside your documents and code with `sentence-transformers`, so you can search by **meaning**, not just by file name.
+A local Python sidecar chunks and embeds the text inside your documents and code with a multilingual MiniLM model running on ONNX Runtime, so you can search by **meaning**, not just by file name — in English and Turkish alike.
 
 </td>
 <td width="33%" valign="top">
@@ -118,15 +120,15 @@ If LocalMind is running without administrator rights, it transparently falls bac
 
 <img src="docs/screenshots/semantic-search.svg" width="880" alt="Semantic search finding content inside documents and code" />
 
-Ask for what you remember, not for what the file is called. *"that Docker PDF I downloaded"*, *"the React login component"*, *"jwt auth implementation"*. LocalMind encodes your query with `all-MiniLM-L6-v2`, compares it against every text chunk stored in LanceDB, and returns the closest matches with the exact line range, so you land on the relevant paragraph rather than on the top of a 90 page document.
+Ask for what you remember, not for what the file is called. *"that Docker PDF I downloaded"*, *"the React login component"*, *"jwt auth implementation"*. LocalMind encodes your query with a multilingual MiniLM-L12 model, compares it against every text chunk stored in LanceDB, and returns the closest matches with the exact line range, so you land on the relevant paragraph rather than on the top of a 90 page document.
 
 **Highlights**
 
-- Local `all-MiniLM-L6-v2` embeddings, roughly 80 MB, downloaded once and cached
+- Local multilingual MiniLM-L12 embeddings, downloaded once and cached in `~/.localmind/models`
 - LanceDB vector store, file based, no server process to run
 - Overlapping ~500 character chunks with full line tracking
 - Relevance score and line range shown on every hit
-- Optional int8 dynamic quantization for roughly 2x faster indexing
+- int8 quantization for a ~2.2x smaller memory footprint, chosen automatically on CPU-only machines
 - Optional OCR for scanned images and screenshots
 
 <br />
@@ -242,7 +244,7 @@ Dark and light themes, English and Turkish out of the box (the i18n layer is rea
 |---|---|
 | **Text & Config** | `.txt` `.md` `.json` `.csv` `.xml` `.yaml` `.yml` `.toml` `.log` `.env` `.sql` |
 | **Source Code** | `.js` `.ts` `.tsx` `.jsx` `.py` `.rs` `.go` `.java` `.c` `.cpp` `.h` `.rb` `.sh` `.bat` `.html` `.css` `.r` |
-| **Documents** | `.pdf` `.docx` `.xlsx` `.pptx` `.ipynb` |
+| **Documents & Books** | `.pdf` `.docx` `.xlsx` `.pptx` `.ipynb` `.epub` `.rtf` |
 | **Images** *(OCR, optional)* | `.png` `.jpg` `.jpeg` `.bmp` `.tiff` |
 
 <br />
@@ -268,8 +270,8 @@ Dark and light themes, English and Turkish out of the box (the i18n layer is rea
                                         │        Python AI Engine         │
                                         │        (FastAPI sidecar)        │
                                         │                                  │
-                                        │  • sentence-transformers         │
-                                        │    (all-MiniLM-L6-v2)            │
+                                        │  • ONNX Runtime embeddings       │
+                                        │    (multilingual MiniLM-L12)     │
                                         │  • LanceDB vector store          │
                                         │  • watchdog file watcher         │
                                         │  • Text extractors                │
@@ -289,18 +291,67 @@ Dark and light themes, English and Turkish out of the box (the i18n layer is rea
 **Semantic search flow (Python sidecar)**
 
 1. In parallel, the frontend sends `POST /search` to the local sidecar
-2. The sidecar encodes the query with `all-MiniLM-L6-v2`
+2. The sidecar encodes the query with a multilingual MiniLM-L12 model through ONNX Runtime (DirectML on a DirectX 12 GPU when one is available, otherwise CPU)
 3. LanceDB returns the top-*k* nearest chunks
 4. Results (file path, snippet, relevance score, line range) are merged into the same UI list
 
 **Indexing flow**
 
-1. Recursively scans the configured folders
-2. Extracts text with `pdfplumber`, `python-docx`, `openpyxl`, `python-pptx`, plain text readers and optional OCR
-3. Splits text into overlapping ~500 character chunks with line tracking
-4. Generates embeddings via `sentence-transformers`, optionally int8 quantized
-5. Stores vectors in LanceDB, a local file based database that needs no server
-6. `watchdog` monitors the file system and updates the index incrementally
+1. Streams the configured folders with `os.scandir`, reusing the stat data the directory listing already returned
+2. Skips anything whose size and modification time still match the stored hash, so a re-index only touches what changed
+3. Extracts text on a worker pool with PyMuPDF, `python-docx`, `openpyxl`, `python-pptx`, plain text readers and optional OCR
+4. Splits text into overlapping ~500 character chunks with line tracking
+5. Groups chunks by length and embeds them in batches, optionally int8 quantized
+6. Buffers the resulting rows and writes them to LanceDB, a local file based database that needs no server
+7. `watchdog` monitors the file system and updates the index incrementally
+
+Extraction and embedding run concurrently: the worker pool always has files in flight, so the model is never waiting on a slow PDF and the disk is never waiting on the model.
+
+<br />
+
+## Performance
+
+Indexing speed and memory use are the two things you actually feel, so both are treated as features rather than side effects.
+
+**Where indexing time goes, and what was done about it**
+
+| Change | Effect |
+|---|---|
+| **Length-grouped, dynamically padded batches** | Chunks are sorted by length and each batch is padded to its own longest sequence instead of a fixed 192 tokens. A short chunk no longer costs a full-length forward pass. **2.7x** faster embedding on a mixed corpus. |
+| **Buffered database writes** | Rows are accumulated and written to LanceDB in batches rather than one write per embedding batch. Every write creates a dataset fragment, and thousands of tiny fragments were slow to produce and slow to compact afterwards. **~30x** faster on the write path (20k rows: 6.9s → 0.2s). |
+| **Continuous extraction pipeline** | Extraction workers are re-fed as each result is consumed, instead of draining a fixed window before starting the next one. No worker sits idle behind the slowest file in its window. |
+| **Rate-limited index statistics** | The distinct-file rollup behind `/index/stats` needs a full column scan. The UI polls it every second, so during a run the engine used to rescan the whole table once per second while it was already busy. |
+
+End to end on a mixed 900-file corpus (13,836 chunks): **70.8s → 45.3s, a 1.56x speedup, with peak memory falling from 38.3 MB to 27.8 MB.**
+
+**Where memory goes, and what was done about it**
+
+| Change | Effect |
+|---|---|
+| **Arena-backed native index** | An MFT record used to own three separate `String`s (`name`, `name_lower`, `ext`). Names now live in one arena per volume and a record is a fixed 32-byte slice reference; the extension is derived on demand. **~65 MB less per million files**, and zero heap allocations per file instead of three. |
+| **Bounded search result selection** | A broad query used to collect *every* match before sorting it. Only the best candidates are kept now, which bounds both the allocation and the sort. |
+| **Streaming folder scan** | The scan yields entries instead of materializing one record per candidate file. On a re-index, unchanged files cost a single path string rather than a full entry — **~33 MB less at 150k files**. |
+| **Released hash cache** | The path-to-hash map that answers "has this file changed?" is dropped when a run finishes and rebuilt lazily on the next one, instead of sitting resident for the life of the sidecar. |
+| **Memory-balanced batch size** | The inference batch is the main memory dial, since activations scale with batch size. 32 measured within 10% of 64 while holding 24 MB less, so it is the default. |
+
+**int8 quantization is a real tradeoff, not a free win**
+
+The embedding model is the largest single thing LocalMind holds, and its precision decides both how much memory that is and how fast indexing runs. Measured on a mixed 600-chunk batch:
+
+| Model precision | Execution provider | Throughput | Peak process memory |
+|---|---|---|---|
+| fp32 | DirectML (GPU) | **448 chunks/s** | 1216 MB |
+| fp32 | CPU | 112 chunks/s | 1143 MB |
+| int8 | CPU | 206 chunks/s | **556 MB** |
+
+Dynamic quantization emits operations DirectML cannot execute, so an int8 graph falls back to the CPU no matter what hardware you have. That leads to a rule with no exceptions:
+
+- **On a DirectX 12 GPU**, fp32 is 2.2x faster and int8 is 2.2x lighter. Neither wins outright, so LocalMind leaves the choice to you and defaults to fp32.
+- **On a CPU-only machine**, int8 is both faster *and* lighter than fp32. There is nothing to weigh, so LocalMind uses it.
+
+The quantization toggle in settings overrides this whenever you want. Switching it rewrites the index, because the two precisions produce different vectors. Choosing int8 also skips the GPU provider entirely, which saves a further ~155 MB that would otherwise be held for a GPU partition the quantized graph never uses.
+
+Figures come from the benchmarks in this repository's history and from `cargo test --lib footprint -- --nocapture`, which prints the per-record footprint table. They will vary with your CPU, GPU, drive and corpus.
 
 <br />
 
@@ -312,9 +363,9 @@ Dark and light themes, English and Turkish out of the box (the i18n layer is rea
 | Frontend | React 19 · TypeScript · Vite · Tailwind CSS v4 |
 | Native search engine | Rust · `rayon` · NTFS MFT / USN Journal · Windows Search fallback |
 | AI engine | FastAPI · Uvicorn · Python |
-| Embeddings | [sentence-transformers](https://www.sbert.net/) · `all-MiniLM-L6-v2` |
-| Vector database | [LanceDB](https://lancedb.com/) |
-| Text extraction | `pdfplumber` · `python-docx` · `openpyxl` · `python-pptx` |
+| Embeddings | [ONNX Runtime](https://onnxruntime.ai/) (DirectML) · `paraphrase-multilingual-MiniLM-L12-v2` · `tokenizers` |
+| Vector database | [LanceDB](https://lancedb.com/) · `pyarrow` |
+| Text extraction | `PyMuPDF` · `python-docx` · `openpyxl` · `python-pptx` · `pdfplumber` (fallback) |
 | File watching | `watchdog` |
 | Syntax highlighting | `highlight.js` |
 | i18n | `i18next` · `react-i18next` |
@@ -352,7 +403,7 @@ cd ..
 npm run tauri dev
 ```
 
-> **First run:** the `all-MiniLM-L6-v2` model (~80 MB) downloads automatically and is cached for every later launch. For full speed native file search LocalMind can request administrator privileges to read the NTFS Master File Table directly; without elevation it falls back to the Windows Search Indexer automatically, so it works either way.
+> **First run:** the multilingual MiniLM-L12 model downloads automatically and is cached in `~/.localmind/models` for every later launch. On a CPU-only machine it is converted to int8 once, which takes about a minute and is then reused. For full speed native file search LocalMind can request administrator privileges to read the NTFS Master File Table directly; without elevation it falls back to the Windows Search Indexer automatically, so it works either way.
 
 <br />
 
@@ -385,9 +436,27 @@ All settings are reachable from the in-app settings panel (gear icon) or the sys
 | Indexed Folders | Documents, Downloads, Desktop | Folders scanned recursively for content indexing |
 | Exclude Patterns | `node_modules`, `*.min.js`, `*.log`, `.git` | Glob patterns to ignore |
 | OCR | Off | Extract text from scanned images, adds roughly 500 MB of models |
-| Embedding Quantization | Off | int8 dynamic quantization, roughly 2x faster indexing |
+| Embedding Quantization | Auto | int8 model: ~2.2x less memory, and on a CPU-only machine ~1.8x faster too. Auto picks int8 when there is no GPU, fp32 when there is. See [Performance](#performance). Changing it moves every vector to a different space, so the index is rebuilt |
 
-Engine level settings are also controllable through environment variables (`LOCALMIND_OCR`, `LOCALMIND_QUANTIZE`), which always take precedence over the stored configuration.
+Engine level settings are also controllable through environment variables (`LOCALMIND_OCR`, `LOCALMIND_QUANTIZE`), which always take precedence over the stored configuration. `LOCALMIND_QUANTIZE=auto` restores the hardware based choice.
+
+### Performance tuning
+
+The defaults are tuned for a balance of speed and memory on an ordinary laptop and should not need touching. If you want to trade one for the other, these environment variables are read by the sidecar at startup:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LOCALMIND_EMBED_BATCH` | `32` | Chunks per model forward pass. The main memory dial: activations scale with it. Raise it for throughput on a machine with RAM to spare, lower it if the sidecar is squeezed |
+| `LOCALMIND_EMBED_POOL` | `128` | Chunks handed to the embedder at once. Larger pools give length grouping more to work with and waste less padding |
+| `LOCALMIND_DB_FLUSH_ROWS` | `1000` | Rows buffered before a LanceDB write. Larger means fewer, bigger fragments on disk |
+| `LOCALMIND_EXTRACT_WORKERS` | half your cores, max 6 | Parallel text extraction threads. Extraction and the embedding model compete for the same cores, so giving extraction all of them makes indexing slower, not faster |
+| `LOCALMIND_INDEX_WINDOW` | `24` | Files held in flight. This is what bounds peak memory during a run |
+| `LOCALMIND_MAX_SEQ` | `192` | Token ceiling per chunk |
+| `LOCALMIND_PAD_MULTIPLE` | `32` | Batches pad to their longest sequence rounded up to this. Smaller wastes less padding but shows the model more distinct input shapes to plan for |
+| `LOCALMIND_ONNX_THREADS` | half your cores, max 8 | ONNX Runtime intra-op threads |
+| `LOCALMIND_STATS_INTERVAL` | `15` | Seconds between full recounts behind `/index/stats` |
+| `LOCALMIND_MAX_PDF_PAGES` | `200` | Pages read per PDF |
+| `LOCALMIND_MAX_CHUNKS_PER_FILE` | `200` | Chunks kept per file, so one huge document cannot monopolize a run |
 
 <br />
 

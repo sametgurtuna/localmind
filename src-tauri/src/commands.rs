@@ -682,32 +682,50 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         let port_file = home.join(".localmind").join("sidecar.port");
         if let Ok(content) = std::fs::read_to_string(&port_file) {
             if let Ok(port) = content.trim().parse::<u16>() {
-                if client
+                if let Ok(resp) = client
                     .get(format!("http://127.0.0.1:{}/health", port))
                     .send()
                     .await
-                    .is_ok()
                 {
-                    sidecar::set_sidecar_port(&app, port);
-                    log::info!("Reconnected to existing AI engine on port {}", port);
-                    return Ok(port);
+                    if resp.status().is_success() {
+                        sidecar::set_sidecar_port(&app, port);
+                        if let Ok(val) = resp.json::<serde_json::Value>().await {
+                            if let Some(pid) = val.get("pid").and_then(|v| v.as_u64()) {
+                                let pid_u32 = pid as u32;
+                                sidecar::set_sidecar_pid(&app, pid_u32);
+                                #[cfg(windows)]
+                                sidecar::assign_pid_to_job(&app, pid_u32);
+                                log::info!("Reconnected to existing AI engine on port {} (PID: {})", port, pid_u32);
+                            } else {
+                                log::info!("Reconnected to existing AI engine on port {}", port);
+                            }
+                        }
+                        return Ok(port);
+                    }
                 }
             }
         }
     }
 
+    let my_pid = std::process::id();
+
     let mut cmd = if let Some(sidecar_exe) = find_sidecar_executable(&app) {
         let engine_dir = sidecar_exe.parent().unwrap_or(&sidecar_exe);
-        log::info!("Starting AI engine sidecar binary from {:?} (dir: {:?})", sidecar_exe, engine_dir);
+        log::info!("Starting AI engine sidecar binary from {:?} (dir: {:?}, parent PID: {})", sidecar_exe, engine_dir, my_pid);
         let mut c = Command::new(&sidecar_exe);
-        c.current_dir(engine_dir);
+        c.current_dir(engine_dir)
+            .arg("--parent-pid")
+            .arg(my_pid.to_string());
         c
     } else {
         let main_py = find_main_py()?;
         let engine_dir = main_py.parent().unwrap_or(&main_py);
-        log::info!("Starting AI engine from Python script {:?} (dir: {:?})", main_py, engine_dir);
+        log::info!("Starting AI engine from Python script {:?} (dir: {:?}, parent PID: {})", main_py, engine_dir, my_pid);
         let mut c = Command::new("python");
-        c.arg(&main_py).current_dir(engine_dir);
+        c.arg(&main_py)
+            .arg("--parent-pid")
+            .arg(my_pid.to_string())
+            .current_dir(engine_dir);
         c
     };
 
@@ -727,6 +745,12 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
 
     let pid = child.id();
     sidecar::set_sidecar_pid(&app, pid);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        sidecar::assign_child_to_job(&app, child.as_raw_handle());
+    }
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
 

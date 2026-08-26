@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -52,6 +53,9 @@ _hash_cache_loaded = False
 
 _stats_cache: dict | None = None
 _stats_cache_rows: int = -1
+_stats_cache_time: float = 0.0
+# Floor on how often the distinct-file rollup is recomputed, in seconds.
+STATS_MIN_INTERVAL = float(os.environ.get("LOCALMIND_STATS_INTERVAL", "15"))
 
 _has_ann_index: bool | None = None
 
@@ -101,12 +105,38 @@ def _scan_columns(columns: list[str], batch_size: int = 50000) -> Iterator[pa.Ta
         offset += len(batch)
 
 
+def _collapse_runs(table: pa.Table, key: str) -> pa.Table:
+    """Drop rows whose `key` equals the previous row's.
+
+    Chunks are written file by file, so a file's ~10 rows sit consecutively.
+    Filtering the runs away in Arrow means `to_pylist` below converts one row
+    per file instead of one per chunk -- an order of magnitude fewer temporary
+    Python strings on a large index.
+    """
+    n = len(table)
+    if n < 2:
+        return table
+    try:
+        import pyarrow.compute as pc
+
+        col = table.column(key).combine_chunks()
+        changed = pc.not_equal(col.slice(1), col.slice(0, n - 1))
+        mask = pa.concat_arrays([
+            pa.array([True]),
+            pc.fill_null(changed, True).cast(pa.bool_()),
+        ])
+        return table.filter(mask)
+    except Exception:
+        return table
+
+
 def _load_hash_cache() -> None:
     global _hash_cache_loaded
     if _hash_cache_loaded:
         return
     try:
         for batch in _scan_columns(["file_path", "file_hash"]):
+            batch = _collapse_runs(batch, "file_path")
             paths = batch.column("file_path").to_pylist()
             hashes = batch.column("file_hash").to_pylist()
             for p, h in zip(paths, hashes):
@@ -155,11 +185,8 @@ def _vectors_to_arrow(vectors: np.ndarray) -> pa.FixedSizeListArray:
     return pa.FixedSizeListArray.from_arrays(flat, EMBEDDING_DIM)
 
 
-def add_records_arrow(metas: list[dict], vectors: np.ndarray) -> None:
-    """Append chunk rows built directly as Arrow columns."""
-    if not metas:
-        return
-
+def _build_arrow(metas: list[dict], vectors: np.ndarray) -> pa.Table:
+    """Build one Arrow table of chunk rows, columns constructed directly."""
     columns = {
         "text": pa.array([m["text"] for m in metas], pa.utf8()),
         "file_path": pa.array([m["file_path"] for m in metas], pa.utf8()),
@@ -174,12 +201,59 @@ def add_records_arrow(metas: list[dict], vectors: np.ndarray) -> None:
         "line_end": pa.array([m.get("line_end", 0) for m in metas], pa.int32()),
         "vector": _vectors_to_arrow(vectors),
     }
-    batch = pa.table([columns[f.name] for f in SCHEMA], schema=SCHEMA)
+    return pa.table([columns[f.name] for f in SCHEMA], schema=SCHEMA)
 
-    get_table().add(batch)
+
+def add_records_arrow(metas: list[dict], vectors: np.ndarray) -> None:
+    """Append chunk rows immediately. Used by the file watcher's small updates;
+    bulk indexing goes through BulkWriter instead."""
+    if not metas:
+        return
+    get_table().add(_build_arrow(metas, vectors))
     for m in metas:
         _hash_cache[m["file_path"]] = m["file_hash"]
     _invalidate_stats()
+
+
+class BulkWriter:
+    """Accumulates chunk rows and writes them to LanceDB in large batches.
+
+    Every `Table.add` call creates a new dataset fragment on disk. Writing one
+    per embedding batch meant a 500k-chunk run produced ~15k tiny fragments:
+    the writes themselves were slow, and the compaction at the end of the run
+    then had to merge all of them. Buffering in memory until `flush_rows` cuts
+    the fragment count by two orders of magnitude, and the buffer's size is
+    bounded (rows x ~1.6KB, so the default ~4MB) rather than growing with the
+    size of the index.
+    """
+
+    __slots__ = ("flush_rows", "_batches", "_rows", "written")
+
+    def __init__(self, flush_rows: int = 2500):
+        self.flush_rows = max(1, flush_rows)
+        self._batches: list[pa.Table] = []
+        self._rows = 0
+        self.written = 0
+
+    def add(self, metas: list[dict], vectors: np.ndarray) -> None:
+        if not metas:
+            return
+        self._batches.append(_build_arrow(metas, vectors))
+        self._rows += len(metas)
+        for m in metas:
+            _hash_cache[m["file_path"]] = m["file_hash"]
+        if self._rows >= self.flush_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._batches:
+            return
+        table = self._batches[0] if len(self._batches) == 1 else pa.concat_tables(self._batches)
+        self._batches = []
+        rows, self._rows = self._rows, 0
+        get_table().add(table)
+        self.written += rows
+        _invalidate_stats()
 
 
 def add_chunks(
@@ -330,21 +404,60 @@ def get_file_embeddings(file_path: str) -> list[list[float]]:
 
 
 def _invalidate_stats() -> None:
-    global _stats_cache
+    """Mark the per-file rollup stale without discarding it.
+
+    Discarding it outright defeated the rate limit: writes land continuously
+    during a run, so every poll found an empty cache and rescanned. Keeping the
+    last rollup lets `get_index_stats` serve it (with an exact, cheap chunk
+    count) until STATS_MIN_INTERVAL has passed.
+    """
+    global _stats_cache_rows
+    _stats_cache_rows = -1
+
+
+def _clear_stats() -> None:
+    global _stats_cache, _stats_cache_rows, _stats_cache_time
     _stats_cache = None
+    _stats_cache_rows = -1
+    _stats_cache_time = 0.0
+
+
+def reset_stats_cache() -> None:
+    """Force the next `get_index_stats` to do a full recount.
+
+    Appends only ever grow the numbers, so the rate limit above may serve a
+    slightly stale rollup during a run. Deletions and the end of a run change
+    the file count in ways the user is looking straight at, so those clear the
+    cache outright instead.
+    """
+    _clear_stats()
 
 
 def get_index_stats() -> dict:
-    """Return indexing statistics by streaming columns (no pandas materialization)."""
-    global _stats_cache, _stats_cache_rows
+    """Return indexing statistics by streaming columns (no pandas materialization).
+
+    The distinct-file count needs a full column scan, so it is rate-limited.
+    The UI polls this endpoint every second while indexing, and the row count
+    changes on every write -- the row-count cache alone therefore never hit
+    during a run, and the engine rescanned the whole table once per second
+    while it was already busy embedding.
+    """
+    global _stats_cache, _stats_cache_rows, _stats_cache_time
     try:
         total_chunks = get_table().count_rows()
-        if _stats_cache is not None and _stats_cache_rows == total_chunks:
-            return _stats_cache
+        if _stats_cache is not None:
+            fresh = _stats_cache_rows == total_chunks
+            throttled = (time.monotonic() - _stats_cache_time) < STATS_MIN_INTERVAL
+            if fresh or throttled:
+                # Chunk count is cheap and exact; only the per-file rollup is stale.
+                return {**_stats_cache, "total_chunks": total_chunks}
 
         seen: dict[str, tuple[str, int]] = {}
         last_indexed = 0.0
         for batch in _scan_columns(["file_path", "file_ext", "file_size", "indexed_at"]):
+            # All chunks of a file share ext/size/indexed_at, so one row per
+            # file is enough for every figure below, `last_indexed` included.
+            batch = _collapse_runs(batch, "file_path")
             paths = batch.column("file_path").to_pylist()
             exts = batch.column("file_ext").to_pylist()
             sizes = batch.column("file_size").to_pylist()
@@ -370,6 +483,7 @@ def get_index_stats() -> dict:
         }
         _stats_cache = stats
         _stats_cache_rows = total_chunks
+        _stats_cache_time = time.monotonic()
         return stats
     except Exception as e:
         logger.error("get_index_stats error: %s", e)
@@ -404,7 +518,7 @@ def remove_files_chunks(file_paths: list[str], batch: int = 200) -> None:
             logger.warning("Batch delete failed (%d paths): %s", len(group), e)
         for p in group:
             _hash_cache.pop(p, None)
-    _invalidate_stats()
+    _clear_stats()
 
 
 def file_exists_with_hash(file_path: str, file_hash: str) -> bool:
@@ -415,6 +529,19 @@ def file_exists_with_hash(file_path: str, file_hash: str) -> bool:
 def known_hashes() -> dict[str, str]:
     _load_hash_cache()
     return _hash_cache
+
+
+def release_hash_cache() -> None:
+    """Drop the path -> hash map once an index run is done.
+
+    It exists only to answer "has this file changed?", which nothing asks
+    between runs, but at a few hundred thousand files it was tens of megabytes
+    of strings sitting in the resident set for the entire life of the sidecar.
+    The next run rebuilds it lazily.
+    """
+    global _hash_cache_loaded
+    _hash_cache.clear()
+    _hash_cache_loaded = False
 
 
 def _ann_index_ready() -> bool:
@@ -436,8 +563,10 @@ def optimize(build_ann: bool = True) -> None:
     table = get_table()
 
     try:
+        if hasattr(table, "compact_files"):
+            table.compact_files()
         table.optimize()
-        logger.info("Table compacted")
+        logger.info("LanceDB table compacted and fragments merged")
     except Exception as e:
         logger.debug("Compaction skipped: %s", e)
 
@@ -480,7 +609,7 @@ def drop_all() -> None:
     _hash_cache.clear()
     _hash_cache_loaded = False
     _has_ann_index = None
-    _invalidate_stats()
+    _clear_stats()
 
 
 def count_rows() -> int:

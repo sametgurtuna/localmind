@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["USE_TORCH"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
@@ -60,7 +59,13 @@ _model_ready = threading.Event()
 def _load_model_background():
     try:
         embedder.load_model()
-        logger.info("Model ready")
+        # Only now is the vector space known for certain: a requested int8
+        # conversion can fall back to fp32, and the migration check has to
+        # compare the stored index against what is really loaded. Running it
+        # before the load meant comparing against the requested precision.
+        _check_model_migration()
+        _trim_memory()
+        logger.info("Model ready (%s)", embedder.model_signature())
     except Exception as e:
         logger.error("Failed to load model: %s", e)
     finally:
@@ -74,6 +79,7 @@ _pending_changes: dict[str, str] = {}
 _pending_lock = threading.Lock()
 _pending_event = threading.Event()
 _CHANGE_FLUSH_DELAY = 3.0
+_CHANGE_CHUNK_BATCH = 512
 
 
 def _on_file_change(path: str, event_type: str):
@@ -146,10 +152,17 @@ def _change_worker():
                     })
 
             if texts:
-                vectors = embedder.get_embeddings(texts)
+                stamp = time.time()
                 for meta, text in zip(metas, texts):
                     meta["text"] = text
-                db.add_records_arrow(metas, vectors)
+                    meta["indexed_at"] = stamp
+                # A burst -- a git checkout, a build -- can queue thousands of
+                # chunks. Embedding and writing them in slices keeps the peak
+                # allocation bounded instead of scaling with the burst.
+                for start in range(0, len(texts), _CHANGE_CHUNK_BATCH):
+                    part_texts = texts[start : start + _CHANGE_CHUNK_BATCH]
+                    part_metas = metas[start : start + _CHANGE_CHUNK_BATCH]
+                    db.add_records_arrow(part_metas, embedder.get_embeddings(part_texts))
                 logger.info("Applied %d file changes (%d chunks)", len(batch), len(texts))
         except Exception as e:
             logger.warning("Failed to apply file changes: %s", e)
@@ -186,120 +199,66 @@ class SimilarRequest(BaseModel):
 async def health():
     return {
         "status": "ok",
+        "pid": os.getpid(),
         "model_ready": _model_ready.is_set(),
         "indexed": db.count_rows(),
     }
 
 
-# Shared executor for parallel search — 3 workers is enough for apps/files/semantic
-# Shared executor for high-speed parallel search
-_search_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="search")
+@app.post("/shutdown")
+async def shutdown_endpoint():
+    """Graceful shutdown triggered by parent process."""
+    def _delayed_exit():
+        time.sleep(0.15)
+        _clean_exit()
+
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return {"status": "shutting_down"}
 
 
-def _unified_omnisearch(query: str, limit: int = 20) -> list[dict]:
-    """High-speed omnichannel search aggregating Quick Actions/Math, Apps, Files, and Semantic Content.
-
-    Optimized Strategy:
-    1. Quick Math / System Actions execute synchronously in < 0.2ms.
-    2. Apps + In-Memory Files execute concurrently in < 25ms.
-    3. Early-Exit: If top match is strong (>= 0.85) on short query (e.g. app/file name),
-       return immediately without waiting for semantic search.
-    4. Semantic vector search is invoked only for multi-word or non-exact queries.
-    """
-    q = query.strip()
-    if not q:
-        return []
-
-    combined: list[dict] = []
-
-    # 1. Quick Math / System Actions — instant (<0.2ms)
-    quick_items = evaluate_quick_query(q)
-    if quick_items:
-        if any(it.get("category") == "calc" for it in quick_items):
-            return quick_items[:limit]
-        combined.extend(quick_items)
-
-    # 2+3. Apps + Files in parallel
-    apps_future = _search_executor.submit(search_apps, q, 6)
-    files_future = _search_executor.submit(fuzzy_file_search, q, _current_folders, 15)
-
-    apps: list[dict] = []
-    files: list[dict] = []
-    try:
-        apps = apps_future.result(timeout=0.35)
-    except Exception as e:
-        logger.debug("App search error or timeout: %s", e)
-    try:
-        files = files_future.result(timeout=0.40)
-    except Exception as e:
-        logger.debug("File search error or timeout: %s", e)
-
-    combined.extend(apps)
-
-    # Deduplicate files that might be same as apps
-    app_targets = {a["filePath"].lower() for a in apps}
-    for f in files:
-        if f["filePath"].lower() not in app_targets:
-            combined.append(f)
-
-    # Sort fast results by score so top matches appear first
-    combined.sort(key=lambda x: x.get("score", 0), reverse=True)
-
-    # 4. Early-Exit Optimization:
-    # If we have an exact/near-exact app or filename match on a 1-2 word query, return instantly!
-    best_fast_score = max((r.get("score", 0) for r in combined), default=0)
-    num_words = len(q.split())
-    is_short_query = num_words <= 2
-
-    if best_fast_score >= 0.85 and is_short_query:
-        return combined[:limit]
-
-    # 5. Semantic search for multi-word, descriptive, or unanswered queries
-    should_run_semantic = (
-        _model_ready.is_set()
-        and len(q) >= 3
-        and (best_fast_score < 0.85 or num_words >= 3)
-    )
-
-    if should_run_semantic:
+def _trim_memory() -> None:
+    """Explicitly run garbage collection and Windows working set trimming."""
+    import gc
+    gc.collect()
+    if sys.platform == "win32":
         try:
-            semantic_items = semantic_search(q, limit=6)
-            existing_paths = {c["filePath"].lower() for c in combined}
-            for s in semantic_items:
-                if s["filePath"].lower() not in existing_paths:
-                    combined.append(s)
-        except Exception as e:
-            logger.debug("Semantic search error in omnisearch: %s", e)
+            import ctypes
+            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+        except Exception:
+            pass
 
-    # Final sort so high scoring semantic matches or exact file matches are ranked correctly
-    combined.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return combined[:limit]
+
+def _background_memory_trimmer():
+    """Periodically trim memory working set to keep idle memory under 150MB."""
+    while True:
+        time.sleep(30)
+        if _index_thread is None or not _index_thread.is_alive():
+            _trim_memory()
 
 
 @app.post("/search", response_model=SearchResponse)
 def search_endpoint(req: SearchRequest):
-    """Synchronous FastAPI handler executed in worker threadpool to prevent event-loop blocking."""
+    """FastAPI search endpoint. Pure semantic search delegate since Rust MFT handles files & apps."""
     q = req.query.strip()
     search_type = req.type.lower()
 
     if not q:
         return SearchResponse(results=[], query=req.query, type=req.type)
 
-    if search_type in ("all", "unified"):
-        results = _unified_omnisearch(q, limit=req.limit)
-    elif search_type == "apps":
-        results = search_apps(q, limit=req.limit)
+    results: list[dict] = []
+
+    if search_type in ("all", "content", "semantic", "unified"):
+        if _model_ready.is_set():
+            try:
+                results = semantic_search(q, limit=req.limit)
+            except Exception as e:
+                logger.debug("Semantic search error: %s", e)
     elif search_type == "files":
         results = fuzzy_file_search(q, _current_folders, limit=req.limit)
-    elif search_type in ("content", "semantic"):
-        if not _model_ready.is_set():
-            results = fuzzy_file_search(q, _current_folders, limit=req.limit)
-        else:
-            results = semantic_search(q, limit=req.limit)
+    elif search_type == "apps":
+        results = search_apps(q, limit=req.limit)
     elif search_type == "actions":
         results = evaluate_quick_query(q)
-    else:
-        results = _unified_omnisearch(q, limit=req.limit)
 
     return SearchResponse(results=results, query=req.query, type=req.type)
 
@@ -553,9 +512,23 @@ class EngineSettingsRequest(BaseModel):
     quantize: bool | None = None
 
 
+def _with_resolved_quantize(data: dict) -> dict:
+    """Report the precision actually in effect, not the raw stored value.
+
+    `quantize` is tri-state: None means "decide from the hardware". The UI
+    renders it as a switch, so it needs the resolved boolean or the toggle
+    would read Off on a CPU-only machine that is in fact running int8.
+    """
+    data = dict(data)
+    data["quantize_auto"] = data.get("quantize") is None
+    data["quantize"] = embedder.quantize_enabled()
+    data["gpu"] = embedder.gpu_available()
+    return data
+
+
 @app.get("/engine/settings")
 async def get_engine_settings():
-    data = engine_settings.load()
+    data = _with_resolved_quantize(engine_settings.load())
     data["indexing"] = bool(_index_thread and _index_thread.is_alive())
     return data
 
@@ -568,11 +541,15 @@ async def set_engine_settings(req: EngineSettingsRequest):
     the index has to be rebuilt; enabling OCR only means images that were
     skipped can now be read, which is a rebuild worth suggesting but not forcing.
     """
+    # Compare resolved precision, not the stored value: switching from "auto"
+    # to the same precision auto had already picked changes nothing and must
+    # not force a rebuild.
+    before_quantized = embedder.quantize_enabled()
     before = engine_settings.load()
     changes = {k: v for k, v in req.model_dump().items() if v is not None}
     after = engine_settings.update(changes)
 
-    quantize_changed = before.get("quantize") != after.get("quantize")
+    quantize_changed = embedder.quantize_enabled() != before_quantized
     ocr_changed = before.get("ocr") != after.get("ocr")
 
     if quantize_changed:
@@ -589,7 +566,7 @@ async def set_engine_settings(req: EngineSettingsRequest):
         threading.Thread(target=_swap_model, daemon=True).start()
 
     return {
-        **after,
+        **_with_resolved_quantize(after),
         "rebuild_required": quantize_changed,
         "rebuild_suggested": ocr_changed and after.get("ocr", False),
     }
@@ -641,12 +618,77 @@ def _write_port_file(port: int) -> None:
 
 
 def _remove_port_file() -> None:
+    """Delete the port handshake file so a stale port is never reused.
+
+    This was referenced from `_clean_exit`, the atexit hook and the uvicorn
+    teardown but never defined, so every one of those paths raised NameError
+    and the file survived the process -- leaving the next launch to try a port
+    nothing was listening on.
+    """
     try:
-        p = _port_file_path()
-        if os.path.exists(p):
-            os.remove(p)
-    except Exception:
+        os.remove(_port_file_path())
+    except OSError:
         pass
+
+
+def _clean_exit() -> None:
+    """Clean up port file and exit immediately."""
+    _remove_port_file()
+    os._exit(0)
+
+
+def _start_parent_watchdog(parent_pid: int | None = None) -> None:
+    """Monitor parent process and terminate sidecar immediately if parent dies."""
+    if parent_pid is None or parent_pid <= 0:
+        try:
+            parent_pid = os.getppid()
+        except Exception:
+            parent_pid = None
+
+    if not parent_pid or parent_pid <= 1:
+        logger.info("Parent PID watchdog disabled (no parent PID supplied)")
+        return
+
+    logger.info("Parent PID watchdog active (monitoring parent PID: %d)", parent_pid)
+
+    def _watch():
+        if sys.platform == "win32":
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            kernel32 = ctypes.windll.kernel32
+            while True:
+                time.sleep(1.0)
+                handle = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+                if not handle:
+                    logger.warning("Parent process %d is no longer reachable. Terminating sidecar.", parent_pid)
+                    _clean_exit()
+                    break
+                wait_res = kernel32.WaitForSingleObject(handle, 0)
+                kernel32.CloseHandle(handle)
+                if wait_res == 0:  # WAIT_OBJECT_0: parent process terminated
+                    logger.warning("Parent process %d terminated. Terminating sidecar.", parent_pid)
+                    _clean_exit()
+                    break
+        else:
+            while True:
+                time.sleep(1.0)
+                try:
+                    os.kill(parent_pid, 0)
+                except (OSError, ProcessLookupError):
+                    logger.warning("Parent process %d terminated. Terminating sidecar.", parent_pid)
+                    _clean_exit()
+                    break
+
+    threading.Thread(target=_watch, daemon=True, name="parent-watchdog").start()
+
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="LocalMind AI Engine")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on")
+    parser.add_argument("--parent-pid", type=int, default=None, help="Parent process ID to monitor")
+    args, _ = parser.parse_known_args()
+    return args
 
 
 def _model_marker_path() -> str:
@@ -683,44 +725,30 @@ def _check_model_migration():
     _write_model_marker()
 
 
-def _prewarm_caches():
-    """Pre-populate file and app caches so first search is instant."""
-    try:
-        from app_launcher import _refresh_cache as refresh_apps
-        refresh_apps()
-        logger.info("App cache pre-warmed")
-    except Exception as e:
-        logger.warning("App cache pre-warm failed: %s", e)
-
-    try:
-        from file_search import refresh_file_cache, _get_default_system_folders
-        default_folders = _get_default_system_folders()
-        if default_folders:
-            refresh_file_cache(default_folders, force=True)
-            logger.info("File cache pre-warmed with %d locations", len(default_folders))
-    except Exception as e:
-        logger.warning("File cache pre-warm failed: %s", e)
-
-
 def main():
     import atexit
-    port = find_free_port()
+    args = parse_args()
+
+    port = args.port or find_free_port()
     _write_port_file(port)
     atexit.register(_remove_port_file)
 
-    print(f"PORT={port}", flush=True)
-    logger.info("Starting LocalMind AI Engine on port %d", port)
+    parent_pid = args.parent_pid or int(os.environ.get("LOCALMIND_PARENT_PID", "0") or 0) or None
+    _start_parent_watchdog(parent_pid)
 
-    _check_model_migration()
+    print(f"PORT={port}", flush=True)
+    logger.info("Starting LocalMind AI Engine on port %d (parent PID: %s)", port, parent_pid)
+
     db.get_table()
 
+    # The migration check runs on the model thread, once the loaded precision
+    # is known -- see _load_model_background.
     logger.info("Loading embedding model in background...")
     model_thread = threading.Thread(target=_load_model_background, daemon=True)
     model_thread.start()
 
-    # Pre-warm file and app caches in background so first search is instant
-    prewarm_thread = threading.Thread(target=_prewarm_caches, daemon=True)
-    prewarm_thread.start()
+    # Background memory trimmer keeps idle working set under 150MB
+    threading.Thread(target=_background_memory_trimmer, daemon=True, name="mem-trimmer").start()
 
     threading.Thread(target=_change_worker, daemon=True, name="change-worker").start()
 
