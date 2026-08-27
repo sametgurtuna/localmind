@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { setSidecarPort as setApiPort, healthCheck } from "../lib/api";
 
 interface SidecarState {
@@ -17,8 +18,9 @@ export function useSidecar() {
     loading: true,
     error: null,
   });
-  const startedRef = useRef(false);
+  const connectingRef = useRef(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const pollHealth = useCallback(async (port: number) => {
     try {
@@ -35,20 +37,19 @@ export function useSidecar() {
         }
       }
     } catch {
-      /* server not ready yet */
+      /* server still loading model */
     }
   }, []);
 
   const connect = useCallback(async () => {
-    if (startedRef.current) return;
-    startedRef.current = true;
+    if (connectingRef.current) return;
+    connectingRef.current = true;
     setState((s) => ({ ...s, loading: true, error: null }));
 
     try {
       let resolvedPort: number | null = null;
 
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
         resolvedPort = await invoke<number>("start_sidecar");
       } catch (ipcErr) {
         // Fallback for dev mode / browser testing: check default port 56789
@@ -66,6 +67,7 @@ export function useSidecar() {
 
       setApiPort(resolvedPort);
       setState((s) => ({ ...s, connected: true, port: resolvedPort, loading: false, error: null }));
+      connectingRef.current = false;
 
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(() => pollHealth(resolvedPort!), 2000);
@@ -73,13 +75,13 @@ export function useSidecar() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setState({ connected: false, modelReady: false, port: null, loading: false, error: msg });
-      startedRef.current = false;
+      connectingRef.current = false;
 
-      // Retry after 4 seconds
-      setTimeout(() => {
-        startedRef.current = false;
+      // Single clean retry after 5 seconds if not connected
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = setTimeout(() => {
         connect();
-      }, 4000);
+      }, 5000);
     }
   }, [pollHealth]);
 
@@ -87,6 +89,7 @@ export function useSidecar() {
     connect();
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
     };
   }, [connect]);
 

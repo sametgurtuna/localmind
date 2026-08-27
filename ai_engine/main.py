@@ -654,19 +654,21 @@ def _start_parent_watchdog(parent_pid: int | None = None) -> None:
     def _watch():
         if sys.platform == "win32":
             import ctypes
-            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
             kernel32 = ctypes.windll.kernel32
             while True:
                 time.sleep(1.0)
-                handle = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid)
                 if not handle:
                     logger.warning("Parent process %d is no longer reachable. Terminating sidecar.", parent_pid)
                     _clean_exit()
                     break
-                wait_res = kernel32.WaitForSingleObject(handle, 0)
+                exit_code = ctypes.c_ulong()
+                success = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
                 kernel32.CloseHandle(handle)
-                if wait_res == 0:  # WAIT_OBJECT_0: parent process terminated
-                    logger.warning("Parent process %d terminated. Terminating sidecar.", parent_pid)
+                if not success or exit_code.value != STILL_ACTIVE:
+                    logger.warning("Parent process %d terminated (code: %s). Terminating sidecar.", parent_pid, exit_code.value)
                     _clean_exit()
                     break
         else:

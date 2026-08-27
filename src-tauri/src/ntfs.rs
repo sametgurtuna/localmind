@@ -11,7 +11,7 @@ pub mod windows_ntfs {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        CloseHandle, GetLastError, ERROR_HANDLE_EOF, GENERIC_READ, HANDLE,
         INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -126,10 +126,10 @@ pub mod windows_ntfs {
             .chain(Some(0))
             .collect();
 
-        let handle = unsafe {
+        let mut handle = unsafe {
             CreateFileW(
                 volume_path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 null_mut(),
                 OPEN_EXISTING,
@@ -137,6 +137,21 @@ pub mod windows_ntfs {
                 null_mut(),
             )
         };
+
+        if handle == INVALID_HANDLE_VALUE {
+            // Try fallback with 0 access mask (device inquiry without direct data read)
+            handle = unsafe {
+                CreateFileW(
+                    volume_path.as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+        }
 
         if handle == INVALID_HANDLE_VALUE {
             let err = unsafe { GetLastError() };

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   X,
   ExternalLink,
@@ -143,7 +144,6 @@ export function FilePreview({
       // 1. Try native Rust command (instant <0.1ms for images, apps, PDF base64, code/text)
       let nativeData: PreviewData | null = null;
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
         const res = await invoke<PreviewData>("get_file_preview_native", {
           path: filePath,
           line: lineStart || 0,

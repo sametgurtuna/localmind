@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _app_cache: list[dict] = []
 _cache_time: float = 0
-_CACHE_TTL = 900  # 15 minutes — installed apps rarely change
+_CACHE_TTL = 900  # 15 minutes (installed apps rarely change)
 
 # Built-in Windows tools and UWP apps with rich aliases
 _BUILTIN_TOOLS = [

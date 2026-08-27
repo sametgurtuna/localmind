@@ -171,7 +171,7 @@ impl MftIndex {
         full_path
     }
 
-    /// Execute sub-millisecond search across apps and all MFT file records
+    /// Execute sub-millisecond search across apps, git repos and all MFT file records
     pub fn search(&self, query: &str, filter_type: &str, limit: usize) -> Vec<NativeSearchResult> {
         let q = query.trim();
         if q.is_empty() {
@@ -189,9 +189,151 @@ impl MftIndex {
         }
 
         let q_lower = q.to_lowercase();
+
+        // 2. Git Repository explicit search prefix (e.g. "repo:localmind", "repo localmind", "git localmind", "git:", "repo")
+        let is_explicit_repo_query = q_lower.starts_with("repo:")
+            || q_lower.starts_with("repo ")
+            || q_lower == "repo"
+            || q_lower.starts_with("git:")
+            || q_lower.starts_with("git ")
+            || q_lower == "git"
+            || q_lower.starts_with("project:")
+            || q_lower.starts_with("project ")
+            || q_lower == "project"
+            || filter_type == "repo"
+            || filter_type == "repos";
+
+        if is_explicit_repo_query {
+            let mut term = q_lower.as_str();
+            if let Some(rest) = term.strip_prefix("repo:") {
+                term = rest;
+            } else if let Some(rest) = term.strip_prefix("repo ") {
+                term = rest;
+            } else if term == "repo" {
+                term = "";
+            } else if let Some(rest) = term.strip_prefix("git:") {
+                term = rest;
+            } else if let Some(rest) = term.strip_prefix("git ") {
+                term = rest;
+            } else if term == "git" {
+                term = "";
+            } else if let Some(rest) = term.strip_prefix("project:") {
+                term = rest;
+            } else if let Some(rest) = term.strip_prefix("project ") {
+                term = rest;
+            } else if term == "project" {
+                term = "";
+            }
+
+            let repo_term_lower = term.trim();
+            let p_chars: Vec<char> = repo_term_lower.chars().collect();
+            let discovered_paths = crate::git::discover_git_repositories(&[]);
+
+            for repo_path in discovered_paths {
+                let name = repo_path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
+                let name_lower = name.to_lowercase();
+
+                let score = if repo_term_lower.is_empty() {
+                    0.95
+                } else if name_lower == repo_term_lower {
+                    1.0
+                } else if name_lower.starts_with(repo_term_lower) {
+                    0.98
+                } else if name_lower.contains(repo_term_lower) {
+                    0.94
+                } else {
+                    fuzzy_match_score_precomputed(&p_chars, repo_term_lower, &name_lower)
+                };
+
+                if score > 0.60 {
+                    let path_str = repo_path.to_string_lossy().to_string();
+                    let status = crate::git::get_git_repo_status(&path_str);
+                    let snippet = if let Some(ref st) = status {
+                        let dirty_text = if st.is_clean {
+                            "Clean".to_string()
+                        } else {
+                            format!("{} uncommitted changes", st.changed_files.len())
+                        };
+                        let last_msg = st.last_commit.as_ref().map_or("".to_string(), |c| format!(" · \"{}\" ({})", c.message, c.time_relative));
+                        format!("🌿 {} · {}{}", st.branch, dirty_text, last_msg)
+                    } else {
+                        path_str.clone()
+                    };
+
+                    results.push(NativeSearchResult {
+                        file_name: name.clone(),
+                        file_path: path_str,
+                        snippet,
+                        score: score + 0.05, // Give repos a slight boost
+                        file_ext: None,
+                        file_size: None,
+                        file_modified: None,
+                        category: "repo".to_string(),
+                        action: "open_in_vscode".to_string(),
+                        action_title: format!("Open {} in VS Code", name),
+                        icon: Some("git".to_string()),
+                    });
+                }
+            }
+
+            if is_explicit_repo_query && (!repo_term_lower.is_empty() || results.len() > 0) {
+                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                return results.into_iter().take(limit).collect();
+            }
+        }
+
+        // 2b. In general search ("all"), also search discovered git repositories
+        if filter_type == "all" && !is_explicit_repo_query && q_lower.len() >= 2 {
+            let p_chars: Vec<char> = q_lower.chars().collect();
+            let discovered_paths = crate::git::discover_git_repositories(&[]);
+            for repo_path in discovered_paths {
+                let name = repo_path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
+                let name_lower = name.to_lowercase();
+                let score = if name_lower == q_lower {
+                    1.0
+                } else if name_lower.starts_with(&q_lower) {
+                    0.98
+                } else if name_lower.contains(&q_lower) {
+                    0.94
+                } else {
+                    fuzzy_match_score_precomputed(&p_chars, &q_lower, &name_lower)
+                };
+
+                if score > 0.70 {
+                    let path_str = repo_path.to_string_lossy().to_string();
+                    let status = crate::git::get_git_repo_status(&path_str);
+                    let snippet = if let Some(ref st) = status {
+                        let dirty_text = if st.is_clean {
+                            "Clean".to_string()
+                        } else {
+                            format!("{} uncommitted changes", st.changed_files.len())
+                        };
+                        let last_msg = st.last_commit.as_ref().map_or("".to_string(), |c| format!(" · \"{}\" ({})", c.message, c.time_relative));
+                        format!("🌿 {} · {}{}", st.branch, dirty_text, last_msg)
+                    } else {
+                        path_str.clone()
+                    };
+
+                    results.push(NativeSearchResult {
+                        file_name: name.clone(),
+                        file_path: path_str,
+                        snippet,
+                        score: score + 0.02,
+                        file_ext: None,
+                        file_size: None,
+                        file_modified: None,
+                        category: "repo".to_string(),
+                        action: "open_in_vscode".to_string(),
+                        action_title: format!("Open {} in VS Code", name),
+                        icon: Some("git".to_string()),
+                    });
+                }
+            }
+        }
+
         let q_tokens: Vec<&str> = q_lower.split_whitespace().filter(|w| !w.is_empty()).collect();
 
-        // 2. Apps Search (if filter allows)
+        // 3. Apps Search (if filter allows)
         if filter_type == "all" || filter_type == "apps" {
             for app in &self.apps {
                 let name_lower = app.name.to_lowercase();
@@ -204,7 +346,7 @@ impl MftIndex {
                 } else if !q_tokens.is_empty() && q_tokens.iter().all(|tok| name_lower.contains(tok)) {
                     0.90
                 } else {
-                    // Fast Fuzzy match for apps (e.g. sptfy -> Spotify, chrm -> Chrome)
+                    // Typo-tolerant fuzzy match for apps (e.g. vscod -> VS Code, notepda -> Notepad, chome -> Chrome)
                     fuzzy_match_score(&q_lower, &name_lower)
                 };
 
@@ -232,16 +374,15 @@ impl MftIndex {
             return results.into_iter().take(limit).collect();
         }
 
-        // 3. Parallel MFT Files Search using Rayon (< 0.5ms across 1,000,000 items)
+        // 4. Parallel MFT Files Search using Rayon (< 0.5ms across 1,000,000 items)
         if filter_type == "all" || filter_type == "files" {
             let q_str = q_lower.as_str();
+            let q_chars: Vec<char> = q_str.chars().collect();
+            let q_chars_slice = q_chars.as_slice();
             let tokens_slice = q_tokens.as_slice();
             let num_tokens = tokens_slice.len();
 
             // Keep only the best `cap` matches instead of collecting every hit.
-            // A one-letter query matches most of the volume, and materializing
-            // that whole list -- then sorting it -- cost tens of megabytes and
-            // the bulk of the query time for results nobody would ever see.
             let cap = (limit * 4).max(64);
             let by_score_desc = |a: &(usize, &CompactFileEntry, f64), b: &(usize, &CompactFileEntry, f64)| {
                 b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
@@ -263,8 +404,8 @@ impl MftIndex {
                         } else if num_tokens > 1 && tokens_slice.iter().all(|tok| fname_lower.contains(tok)) {
                             0.88
                         } else if q_str.len() >= 3 {
-                            // Subsequence Fuzzy Matching for files
-                            fuzzy_match_score(q_str, fname_lower)
+                            // Subsequence & Typo-Tolerant Damerau-Levenshtein Fuzzy Matching
+                            fuzzy_match_score_precomputed(q_chars_slice, q_str, fname_lower)
                         } else {
                             0.0
                         };
@@ -299,18 +440,41 @@ impl MftIndex {
                 let name = vol.name(file);
                 let full_path = self.reconstruct_path(vol_idx, file.parent_frn, name);
                 let ext = vol.ext(file);
+
+                // If directory is a Git repository, classify as "repo" with smart snippet
+                let is_dir = file.is_dir;
+                let mut category = if is_dir { "folder".to_string() } else { "file".to_string() };
+                let mut snippet = full_path.clone();
+                let mut action = "open_file".to_string();
+                let mut action_title = format!("Open {}", name);
+                let mut icon = None;
+
+                if is_dir {
+                    let path_obj = std::path::Path::new(&full_path);
+                    if crate::git::is_git_repo(path_obj) {
+                        category = "repo".to_string();
+                        action = "open_in_vscode".to_string();
+                        action_title = format!("Open {} in VS Code", name);
+                        icon = Some("git".to_string());
+                        if let Some(st) = crate::git::get_git_repo_status(&full_path) {
+                            let dirty_str = if st.is_clean { "Clean".to_string() } else { format!("{} uncommitted changes", st.changed_files.len()) };
+                            snippet = format!("🌿 {} · {}", st.branch, dirty_str);
+                        }
+                    }
+                }
+
                 results.push(NativeSearchResult {
                     file_name: name.to_string(),
-                    file_path: full_path.clone(),
-                    snippet: full_path,
+                    file_path: full_path,
+                    snippet,
                     score,
                     file_ext: if ext.is_empty() { None } else { Some(ext.to_string()) },
                     file_size: None,
                     file_modified: None,
-                    category: if file.is_dir { "folder".to_string() } else { "file".to_string() },
-                    action: "open_file".to_string(),
-                    action_title: format!("Open {}", name),
-                    icon: None,
+                    category,
+                    action,
+                    action_title,
+                    icon,
                 });
 
                 if results.len() >= limit * 2 {
@@ -324,20 +488,91 @@ impl MftIndex {
     }
 }
 
-/// Ultra-fast fuzzy subsequence matching with word boundary, prefix, and consecutive bonuses.
-/// Returns a score between 0.0 and 1.0 (or 0.0 if not matched).
+/// Zero-allocation bounded Damerau-Levenshtein calculation (max distance 1 or 2).
+/// Supports insertions, deletions, substitutions, and adjacent character swaps (transpositions).
 #[inline]
-pub fn fuzzy_match_score(pattern: &str, target: &str) -> f64 {
-    if pattern.is_empty() || target.is_empty() {
-        return 0.0;
+pub fn damerau_levenshtein_bounded(s1: &[char], s2: &[char], max_dist: usize) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+
+    if len1.abs_diff(len2) > max_dist {
+        return max_dist + 1;
+    }
+    if len1 == 0 {
+        return len2;
+    }
+    if len2 == 0 {
+        return len1;
+    }
+    if len1 > 48 || len2 > 48 {
+        return max_dist + 1;
     }
 
-    let p_chars: Vec<char> = pattern.chars().collect();
-    let t_chars: Vec<char> = target.chars().collect();
-    let p_len = p_chars.len();
-    let t_len = t_chars.len();
+    let mut d = [[0usize; 50]; 50];
 
-    if p_len > t_len {
+    for i in 0..=len1 {
+        d[i][0] = i;
+    }
+    for j in 0..=len2 {
+        d[0][j] = j;
+    }
+
+    for i in 1..=len1 {
+        let mut min_in_row = d[i][0];
+        let char1 = s1[i - 1];
+
+        for j in 1..=len2 {
+            let char2 = s2[j - 1];
+            let cost = if char1 == char2 { 0 } else { 1 };
+
+            let mut val = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+
+            if i > 1 && j > 1 && char1 == s2[j - 2] && s1[i - 2] == char2 {
+                val = val.min(d[i - 2][j - 2] + 1);
+            }
+
+            d[i][j] = val;
+            min_in_row = min_in_row.min(val);
+        }
+
+        if min_in_row > max_dist {
+            return max_dist + 1;
+        }
+    }
+
+    d[len1][len2]
+}
+
+/// Check if pattern matches first letters of words in target (e.g. "vsc" -> "Visual Studio Code")
+#[inline]
+pub fn match_acronym(p_chars: &[char], target: &str) -> f64 {
+    if p_chars.len() < 2 {
+        return 0.0;
+    }
+    let mut p_idx = 0;
+    let mut prev_is_sep = true;
+
+    for c in target.chars() {
+        if prev_is_sep && p_idx < p_chars.len() && c == p_chars[p_idx] {
+            p_idx += 1;
+        }
+        prev_is_sep = matches!(c, ' ' | '_' | '-' | '.' | '/' | '\\');
+    }
+
+    if p_idx == p_chars.len() {
+        0.92
+    } else {
+        0.0
+    }
+}
+
+/// Ultra-fast zero-allocation fuzzy matching with typo tolerance, acronyms, and subsequence bonuses.
+#[inline]
+pub fn fuzzy_match_score_precomputed(p_chars: &[char], pattern: &str, target: &str) -> f64 {
+    let p_len = p_chars.len();
+    if p_len == 0 || target.is_empty() {
         return 0.0;
     }
 
@@ -356,51 +591,88 @@ pub fn fuzzy_match_score(pattern: &str, target: &str) -> f64 {
         return 0.94;
     }
 
-    // 4. Subsequence Fuzzy Match with bonuses
+    // 4. Acronym match (e.g. vsc -> Visual Studio Code, np -> Notepad++)
+    let acronym_score = match_acronym(p_chars, target);
+    if acronym_score > 0.0 {
+        return acronym_score;
+    }
+
+    // 5. Subsequence Fuzzy Match with bonuses
     let mut p_idx = 0;
     let mut consecutive_bonus: f64 = 0.0;
     let mut boundary_bonus: f64 = 0.0;
     let mut prev_matched_idx = 0usize;
-    let mut matched_indices = Vec::with_capacity(p_len);
+    let mut first_matched_idx = 0usize;
+    let mut last_matched_idx = 0usize;
+    let mut prev_t_char = '\0';
 
-    for (t_idx, &t_char) in t_chars.iter().enumerate() {
+    for (t_idx, t_char) in target.chars().enumerate() {
         if p_idx < p_len && t_char == p_chars[p_idx] {
-            // Check if boundary (start of string or preceded by non-alphanumeric)
             if t_idx == 0 {
                 boundary_bonus += 0.12;
-            } else {
-                let prev_char = t_chars[t_idx - 1];
-                if matches!(prev_char, '_' | '-' | '.' | ' ' | '/' | '\\' | ':') {
-                    boundary_bonus += 0.10;
-                }
+            } else if matches!(prev_t_char, '_' | '-' | '.' | ' ' | '/' | '\\' | ':') {
+                boundary_bonus += 0.10;
             }
 
-            // Consecutive match bonus
             if p_idx > 0 && t_idx == prev_matched_idx + 1 {
                 consecutive_bonus += 0.06;
             }
 
+            if p_idx == 0 {
+                first_matched_idx = t_idx;
+            }
+            last_matched_idx = t_idx;
             prev_matched_idx = t_idx;
-            matched_indices.push(t_idx);
             p_idx += 1;
+        }
+        prev_t_char = t_char;
+    }
+
+    if p_idx == p_len {
+        let span = (last_matched_idx.saturating_sub(first_matched_idx) + 1) as f64;
+        let density = (p_len as f64) / span.max(1.0);
+        let raw_score = 0.65 + (density * 0.12) + (consecutive_bonus.min(0.08)) + (boundary_bonus.min(0.08));
+        return raw_score.clamp(0.0, 0.92);
+    }
+
+    // 6. Typo Tolerance with Bounded Damerau-Levenshtein Edit Distance (>= 3 chars)
+    if p_len >= 3 {
+        let max_allowed_dist = if p_len <= 5 { 1 } else { 2 };
+        let t_chars: Vec<char> = target.chars().collect();
+
+        // 6a. Direct whole target distance
+        let dist = damerau_levenshtein_bounded(p_chars, &t_chars, max_allowed_dist);
+        if dist <= max_allowed_dist {
+            let penalty = (dist as f64) * 0.12;
+            return (0.86 - penalty).max(0.65);
+        }
+
+        // 6b. Word token prefix distance (e.g. "pyhton" -> "python_file.py", "vscod" -> "vscode.exe", "notepda" -> "notepad")
+        for word in target.split(|c: char| !c.is_alphanumeric()) {
+            if word.len() >= p_len.saturating_sub(1) {
+                let w_chars: Vec<char> = word.chars().collect();
+                let check_len = p_len.min(w_chars.len());
+                let prefix_slice = &w_chars[..check_len];
+                let w_dist = damerau_levenshtein_bounded(p_chars, prefix_slice, max_allowed_dist);
+                if w_dist <= max_allowed_dist {
+                    let penalty = (w_dist as f64) * 0.12;
+                    let length_penalty = ((w_chars.len().saturating_sub(p_len)) as f64) * 0.01;
+                    return (0.85 - penalty - length_penalty).max(0.65);
+                }
+            }
         }
     }
 
-    // If not all characters of pattern were found in order, no match
-    if p_idx < p_len {
-        return 0.0;
-    }
-
-    // Calculate span coverage and density
-    let first_idx = matched_indices[0];
-    let last_idx = matched_indices[p_len - 1];
-    let span = (last_idx - first_idx + 1) as f64;
-    let density = (p_len as f64) / span; // 1.0 if compact, < 1.0 if scattered
-
-    // Base fuzzy score is 0.65 + bonuses
-    let raw_score = 0.65 + (density * 0.12) + (consecutive_bonus.min(0.08)) + (boundary_bonus.min(0.08));
-    raw_score.clamp(0.0, 0.92)
+    0.0
 }
+
+/// Fallback wrapper for tests
+#[inline]
+pub fn fuzzy_match_score(pattern: &str, target: &str) -> f64 {
+    let p_chars: Vec<char> = pattern.chars().collect();
+    fuzzy_match_score_precomputed(&p_chars, pattern, target)
+}
+
 
 /// Simple safe math evaluator for calculations like "150 * 4" or "1024 / 8"
 fn evaluate_math(q: &str) -> Option<NativeSearchResult> {
@@ -472,7 +744,107 @@ fn format_num(val: f64) -> String {
     }
 }
 
-/// Scan all NTFS volumes in background and populate MFT index
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IndexedVolumeInfo {
+    pub drive_letter: String,
+    pub file_count: usize,
+    pub is_mft: bool,
+}
+
+impl MftIndex {
+    pub fn get_volumes_info(&self) -> Vec<IndexedVolumeInfo> {
+        self.volumes
+            .iter()
+            .map(|v| IndexedVolumeInfo {
+                drive_letter: format!("{}:\\", v.drive_letter),
+                file_count: v.files.len(),
+                is_mft: v.journal_id != 0,
+            })
+            .collect()
+    }
+}
+
+fn scan_volume_fallback(drive: char, vol_idx: u8) -> Option<VolumeData> {
+    let root = format!("{}:\\", drive);
+    let root_path = std::path::PathBuf::from(&root);
+    if !root_path.exists() {
+        return None;
+    }
+
+    log::info!("Scanning volume {}:\\ via fast directory crawler fallback...", drive);
+    let mut vol = VolumeData {
+        drive_letter: drive,
+        journal_id: 0,
+        next_usn: 0,
+        parent_map: HashMap::with_capacity(20_000),
+        files: Vec::with_capacity(150_000),
+        names: String::with_capacity(150_000 * 35),
+    };
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut next_frn: u64 = 1;
+
+    let root_frn = next_frn;
+    next_frn += 1;
+    let (root_off, root_name_len, _) = vol.intern(&root);
+    vol.parent_map.insert(root_frn, (0, root_off, root_name_len));
+    queue.push_back((root_frn, root_path));
+
+    let skip_dirs = [
+        "$recycle.bin",
+        "system volume information",
+        "msocache",
+        "recovery",
+        "$windows.~bt",
+        "$windows.~ws",
+        ".git",
+        "node_modules",
+    ];
+
+    while let Some((curr_parent_frn, dir_path)) = queue.pop_front() {
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let fname = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+
+                let fname_lower = fname.to_lowercase();
+                if skip_dirs.iter().any(|&s| fname_lower == s) {
+                    continue;
+                }
+
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let my_frn = next_frn;
+                next_frn += 1;
+
+                let (off, name_len, lower_len) = vol.intern(&fname);
+
+                if is_dir {
+                    vol.parent_map.insert(my_frn, (curr_parent_frn, off, name_len));
+                    queue.push_back((my_frn, entry.path()));
+                }
+
+                vol.files.push(CompactFileEntry {
+                    frn: my_frn,
+                    parent_frn: curr_parent_frn,
+                    name_off: off,
+                    name_len,
+                    lower_len,
+                    is_dir,
+                    volume_idx: vol_idx,
+                });
+            }
+        }
+    }
+
+    vol.names.shrink_to_fit();
+    vol.files.shrink_to_fit();
+    log::info!("Volume {}:\\ fallback scan complete: {} files found", drive, vol.files.len());
+    Some(vol)
+}
+
+/// Scan all NTFS & FAT32/exFAT volumes in background and populate in-memory index
 pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
     std::thread::spawn(move || {
         let start = Instant::now();
@@ -488,7 +860,7 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
         let apps = scan_windows_apps();
         log::info!("Found {} Windows applications & system tools", apps.len());
 
-        // 2. Scan NTFS Volumes (C:\, D:\, etc.)
+        // 2. Scan All Storage Volumes (C:\, D:\, E:\, etc.)
         let mut volumes_data = Vec::new();
         let mut total_files = 0;
 
@@ -496,25 +868,27 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
         {
             for letter in b'C'..=b'Z' {
                 let drive = letter as char;
+                let root = format!("{}:\\", drive);
+                if !std::path::Path::new(&root).exists() {
+                    continue;
+                }
+
+                let vol_idx = volumes_data.len() as u8;
+                let mut scanned_vol = None;
+
                 if is_ntfs_drive(drive) {
                     log::info!("Scanning NTFS volume {}:\\ via MFT...", drive);
                     match scan_volume_mft(drive) {
                         Ok(scan_res) => {
                             let count = scan_res.records.len();
-                            total_files += count;
-                            log::info!("Volume {}:\\ scanned: {} files in {:?}", drive, count, start.elapsed());
+                            log::info!("Volume {}:\\ scanned via MFT: {} files in {:?}", drive, count, start.elapsed());
 
-                            let vol_idx = volumes_data.len() as u8;
                             let mut vol = VolumeData {
                                 drive_letter: drive,
                                 journal_id: scan_res.journal_id,
                                 next_usn: scan_res.next_usn,
                                 parent_map: HashMap::with_capacity(count / 8),
                                 files: Vec::with_capacity(count),
-                                // Names plus their lowercased forms, roughly
-                                // 40 bytes per record. Reserving up front keeps
-                                // the arena from being reallocated and copied
-                                // a dozen times while a volume is scanned.
                                 names: String::with_capacity(count * 40),
                             };
 
@@ -534,23 +908,31 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
                                 });
                             }
 
-                            // The arena is written once and read forever; hand
-                            // back whatever the capacity estimate overshot.
                             vol.names.shrink_to_fit();
                             vol.files.shrink_to_fit();
-                            volumes_data.push(vol);
+                            scanned_vol = Some(vol);
                         }
                         Err(e) => {
-                            log::warn!("MFT scan skipped for drive {}: {}", drive, e);
+                            log::warn!("MFT scan failed for drive {}: {}, falling back to fast crawler...", drive, e);
                         }
                     }
+                }
+
+                // If MFT was skipped/failed or drive is non-NTFS, crawl via fast filesystem walker
+                if scanned_vol.is_none() {
+                    scanned_vol = scan_volume_fallback(drive, vol_idx);
+                }
+
+                if let Some(vol) = scanned_vol {
+                    total_files += vol.files.len();
+                    volumes_data.push(vol);
                 }
             }
         }
 
         let elapsed = start.elapsed();
         log::info!(
-            "MFT Indexing Complete: {} total files & {} apps indexed in {:.2?}",
+            "MFT & Drive Indexing Complete: {} total files & {} apps indexed in {:.2?}",
             total_files,
             apps.len(),
             elapsed
@@ -590,9 +972,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Simulate hierarchy: C:\Users\samet\Documents\invoice_2026.pdf
-        // Directories are interned like any other record; parent_map points at
-        // the arena slice rather than owning a copy of the name.
         for (frn, parent, name) in [(1u64, 0u64, "Users"), (2, 1, "samet"), (3, 2, "Documents")] {
             let (off, len, _) = vol.intern(name);
             vol.parent_map.insert(frn, (parent, off, len));
@@ -645,6 +1024,13 @@ mod tests {
         assert!(fuzzy_match_score("chrm", "google chrome.lnk") > 0.70);
         assert!(fuzzy_match_score("vsc", "visual studio code") > 0.70);
         assert_eq!(fuzzy_match_score("xyz123", "spotify.exe"), 0.0);
+
+        // Typo tolerance tests (Damerau-Levenshtein / Transpositions / Deletions)
+        assert!(fuzzy_match_score("vscod", "vscode.exe") > 0.70);
+        assert!(fuzzy_match_score("notepda", "notepad.exe") > 0.70);
+        assert!(fuzzy_match_score("pyhton", "python.exe") > 0.70);
+        assert!(fuzzy_match_score("dockre", "docker desktop.lnk") > 0.70);
+        assert!(fuzzy_match_score("chome", "google chrome.lnk") > 0.70);
     }
 }
 

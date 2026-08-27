@@ -5,6 +5,24 @@ use std::process::Command;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+static START_SIDECAR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub fn silent_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 use crate::mft_index::{scan_all_drives_background, NativeSearchResult, SharedMftIndex};
 use crate::sidecar;
 
@@ -34,11 +52,11 @@ pub fn get_mft_status(app: tauri::AppHandle) -> serde_json::Value {
                 "total_files": index.total_files,
                 "total_apps": index.apps.len(),
                 "scan_time_ms": index.scan_time_ms,
-                "volumes": index.volumes.iter().map(|v| format!("{}:\\", v.drive_letter)).collect::<Vec<_>>()
+                "volumes": index.get_volumes_info()
             });
         }
     }
-    serde_json::json!({ "status": "unavailable", "total_files": 0, "total_apps": 0 })
+    serde_json::json!({ "status": "unavailable", "total_files": 0, "total_apps": 0, "volumes": [] })
 }
 
 #[tauri::command]
@@ -319,13 +337,14 @@ pub fn save_app_config_to_disk(app: &tauri::AppHandle, config: &AppConfig) -> Re
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn enable_windows_autostart(app_name: &str, app_path: &str, args: &[&str]) -> Result<(), String> {
     let mut cmd_str = format!("\"{}\"", app_path);
     for arg in args {
         cmd_str.push_str(&format!(" {}", arg));
     }
 
-    let output = Command::new("reg")
+    let output = silent_command("reg")
         .args([
             "add",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -350,7 +369,7 @@ pub fn enable_windows_autostart(app_name: &str, app_path: &str, args: &[&str]) -
 
 #[cfg(windows)]
 pub fn disable_windows_autostart(app_name: &str) -> Result<(), String> {
-    let _ = Command::new("reg")
+    let _ = silent_command("reg")
         .args([
             "delete",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -364,8 +383,9 @@ pub fn disable_windows_autostart(app_name: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn is_windows_autostart_enabled(app_name: &str) -> bool {
-    let output = Command::new("reg")
+    let output = silent_command("reg")
         .args([
             "query",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -411,14 +431,22 @@ pub fn update_global_shortcut(app: tauri::AppHandle, shortcut: String) -> Result
 pub fn set_autostart(app: tauri::AppHandle, enable: bool) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| format!("Could not determine executable path: {}", e))?;
-        let exe_str = exe_path.to_string_lossy();
+        #[cfg(not(debug_assertions))]
+        {
+            let exe_path = std::env::current_exe()
+                .map_err(|e| format!("Could not determine executable path: {}", e))?;
+            let exe_str = exe_path.to_string_lossy();
 
-        if enable {
-            enable_windows_autostart("LocalMind", &exe_str, &["--minimized", "--autostart"])?;
-        } else {
-            disable_windows_autostart("LocalMind")?;
+            if enable {
+                enable_windows_autostart("LocalMind", &exe_str, &["--minimized", "--autostart"])?;
+            } else {
+                disable_windows_autostart("LocalMind")?;
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            // In debug mode, avoid registering target/debug/localmind.exe which depends on Vite dev server
+            let _ = disable_windows_autostart("LocalMind");
         }
     }
 
@@ -430,10 +458,16 @@ pub fn set_autostart(app: tauri::AppHandle, enable: bool) -> Result<bool, String
 }
 
 #[tauri::command]
-pub fn get_autostart(_app: tauri::AppHandle) -> bool {
-    #[cfg(windows)]
+pub fn get_autostart(app: tauri::AppHandle) -> bool {
+    #[cfg(all(windows, not(debug_assertions)))]
     {
-        is_windows_autostart_enabled("LocalMind")
+        let config = load_app_config(&app);
+        config.autostart && is_windows_autostart_enabled("LocalMind")
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        let config = load_app_config(&app);
+        config.autostart
     }
     #[cfg(not(windows))]
     {
@@ -468,7 +502,7 @@ pub fn get_default_folders() -> Vec<String> {
 
 #[tauri::command]
 pub fn open_in_vscode(path: String) -> Result<(), String> {
-    Command::new("cmd")
+    silent_command("cmd")
         .args(["/C", "code", &path])
         .spawn()
         .map_err(|e| format!("Failed to open in VS Code: {}", e))?;
@@ -483,7 +517,7 @@ pub fn open_in_terminal(path: String) -> Result<(), String> {
     } else {
         p.parent().unwrap_or(&p).to_path_buf()
     };
-    Command::new("cmd")
+    silent_command("cmd")
         .args(["/C", "start", "cmd", "/K", &format!("cd /d {}", folder.display())])
         .spawn()
         .map_err(|e| format!("Failed to open terminal: {}", e))?;
@@ -499,7 +533,7 @@ pub fn delete_file(path: String) -> Result<(), String> {
 pub fn launch_app(path: String) -> Result<(), String> {
     if path.contains(":") && !path.contains("\\") && !path.contains("/") {
         // Protocol handler like ms-settings: or calculator:
-        Command::new("cmd")
+        silent_command("cmd")
             .args(["/C", "start", &path])
             .spawn()
             .map_err(|e| format!("Failed to launch protocol: {}", e))?;
@@ -513,7 +547,7 @@ pub fn launch_app(path: String) -> Result<(), String> {
 pub fn show_in_folder(path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
     if p.exists() {
-        Command::new("explorer")
+        silent_command("explorer")
             .args(["/select,", &path])
             .spawn()
             .map_err(|e| format!("Failed to show in folder: {}", e))?;
@@ -525,7 +559,7 @@ pub fn show_in_folder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn run_as_admin(path: String) -> Result<(), String> {
-    Command::new("powershell")
+    silent_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -538,7 +572,7 @@ pub fn run_as_admin(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn system_command(command: String) -> Result<(), String> {
-    Command::new("cmd")
+    silent_command("cmd")
         .args(["/C", &command])
         .spawn()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
@@ -560,7 +594,7 @@ pub fn open_file_at_line(path: String, line: u32) -> Result<(), String> {
 
     if code_exts.contains(&ext.as_str()) && line > 0 {
         let goto = format!("{}:{}", path, line);
-        if Command::new("cmd")
+        if silent_command("cmd")
             .args(["/C", "code", "--goto", &goto])
             .spawn()
             .is_ok()
@@ -658,8 +692,21 @@ fn find_main_py() -> Result<PathBuf, String> {
     ))
 }
 
+fn find_python_executable() -> &'static str {
+    #[cfg(windows)]
+    {
+        if silent_command("pythonw").arg("--version").output().is_ok() {
+            return "pythonw";
+        }
+    }
+    "python"
+}
+
 #[tauri::command]
 pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
+    // 0. Ensure single-flight execution so React strict mode or rapid calls don't spawn duplicate sidecars
+    let _lock = START_SIDECAR_MUTEX.lock().await;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
@@ -707,8 +754,35 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         }
     }
 
+    // 3. Before launching a new sidecar, cleanly eliminate any stale/orphaned processes
+    sidecar::cleanup_stale_sidecars();
+
     let my_pid = std::process::id();
 
+    #[cfg(debug_assertions)]
+    let mut cmd = if let Ok(main_py) = find_main_py() {
+        let engine_dir = main_py.parent().unwrap_or(&main_py);
+        let py_cmd = find_python_executable();
+        log::info!("(Dev Mode) Starting AI engine from Python ({}) script {:?} (dir: {:?}, parent PID: {})", py_cmd, main_py, engine_dir, my_pid);
+        let mut c = Command::new(py_cmd);
+        c.arg(&main_py)
+            .arg("--parent-pid")
+            .arg(my_pid.to_string())
+            .current_dir(engine_dir);
+        c
+    } else if let Some(sidecar_exe) = find_sidecar_executable(&app) {
+        let engine_dir = sidecar_exe.parent().unwrap_or(&sidecar_exe);
+        log::info!("Starting AI engine sidecar binary from {:?} (dir: {:?}, parent PID: {})", sidecar_exe, engine_dir, my_pid);
+        let mut c = Command::new(&sidecar_exe);
+        c.current_dir(engine_dir)
+            .arg("--parent-pid")
+            .arg(my_pid.to_string());
+        c
+    } else {
+        return Err("No AI engine executable or Python script found".to_string());
+    };
+
+    #[cfg(not(debug_assertions))]
     let mut cmd = if let Some(sidecar_exe) = find_sidecar_executable(&app) {
         let engine_dir = sidecar_exe.parent().unwrap_or(&sidecar_exe);
         log::info!("Starting AI engine sidecar binary from {:?} (dir: {:?}, parent PID: {})", sidecar_exe, engine_dir, my_pid);
@@ -720,8 +794,9 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
     } else {
         let main_py = find_main_py()?;
         let engine_dir = main_py.parent().unwrap_or(&main_py);
-        log::info!("Starting AI engine from Python script {:?} (dir: {:?}, parent PID: {})", main_py, engine_dir, my_pid);
-        let mut c = Command::new("python");
+        let py_cmd = find_python_executable();
+        log::info!("Starting AI engine from Python ({}) script {:?} (dir: {:?}, parent PID: {})", py_cmd, main_py, engine_dir, my_pid);
+        let mut c = Command::new(py_cmd);
         c.arg(&main_py)
             .arg("--parent-pid")
             .arg(my_pid.to_string())
@@ -729,8 +804,9 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
         c
     };
 
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(target_os = "windows")]
     {
@@ -812,6 +888,15 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
             .await
         {
             if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    if let Some(real_pid) = val.get("pid").and_then(|v| v.as_u64()) {
+                        let real_pid_u32 = real_pid as u32;
+                        sidecar::set_sidecar_pid(&app, real_pid_u32);
+                        #[cfg(windows)]
+                        sidecar::assign_pid_to_job(&app, real_pid_u32);
+                        log::info!("Bound AI engine worker PID {} to Job Object", real_pid_u32);
+                    }
+                }
                 log::info!("AI engine health check passed on port {}", port);
                 return Ok(port);
             }
@@ -820,4 +905,34 @@ pub async fn start_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
 
     log::warn!("AI engine health check timed out, returning port anyway");
     Ok(port)
+}
+
+#[tauri::command]
+pub fn get_git_status(path: String) -> Option<crate::git::GitRepoStatus> {
+    crate::git::get_git_repo_status(&path)
+}
+
+#[tauri::command]
+pub fn search_git_repos(app: tauri::AppHandle, query: String) -> Vec<NativeSearchResult> {
+    if let Some(shared_index) = app.try_state::<SharedMftIndex>() {
+        if let Ok(index) = shared_index.read() {
+            let q = if query.starts_with("repo:") || query.starts_with("git:") {
+                query
+            } else {
+                format!("repo:{}", query)
+            };
+            return index.search(&q, "repo", 25);
+        }
+    }
+    Vec::new()
+}
+
+#[tauri::command]
+pub fn open_git_remote(path: String) -> Result<(), String> {
+    if let Some(status) = crate::git::get_git_repo_status(&path) {
+        if let Some(web_url) = status.remote_web_url {
+            return open::that(&web_url).map_err(|e| format!("Failed to open remote URL: {}", e));
+        }
+    }
+    Err("No valid remote URL found for this repository".to_string())
 }

@@ -1,9 +1,9 @@
 import type { SearchResult, SearchTab } from "../hooks/useSearch";
 
-export type ResultCategory = "converter" | "calc" | "app" | "file" | "content" | "web";
+export type ResultCategory = "converter" | "calc" | "app" | "repo" | "file" | "content" | "web";
 
 export interface GroupedResult extends SearchResult {
-  /** Position in the flattened display order — what keyboard navigation uses. */
+  /** Position in the flattened display order (what keyboard navigation uses). */
   flatIndex: number;
 }
 
@@ -14,11 +14,12 @@ export interface ResultGroup {
   items: GroupedResult[];
 }
 
-/** Display order of the sections. Instant answers first, then apps, then filenames, then in-file content, then web fallbacks. */
+/** Display order of the sections. Instant answers first, then apps, then git repos, then filenames, then in-file content, then web fallbacks. */
 const ORDER: { category: ResultCategory; labelKey: string; fallbackLabel: string }[] = [
   { category: "converter", labelKey: "results.secConverter", fallbackLabel: "Unit & Currency Converter" },
   { category: "calc", labelKey: "results.secCalc", fallbackLabel: "Calculations & Actions" },
   { category: "app", labelKey: "results.secApps", fallbackLabel: "Applications" },
+  { category: "repo", labelKey: "results.secRepos", fallbackLabel: "Git Repositories & Workspaces" },
   { category: "file", labelKey: "results.secFiles", fallbackLabel: "Files" },
   { category: "content", labelKey: "results.secContent", fallbackLabel: "In-File Content" },
   { category: "web", labelKey: "results.secWeb", fallbackLabel: "Web Searches & Shortcuts" },
@@ -29,6 +30,7 @@ function categoryOf(result: SearchResult): ResultCategory {
   if (result.category === "calc" || result.category === "action") return "calc";
   if (result.category === "web") return "web";
   if (result.category === "app") return "app";
+  if (result.category === "repo") return "repo";
   if (result.category === "content") return "content";
   return "file";
 }
@@ -73,7 +75,7 @@ export function groupResults(results: SearchResult[], activeTab: SearchTab): Res
   return groups;
 }
 
-/** The results in display order — what Enter, arrows and Ctrl+N act on. */
+/** The results in display order (what Enter, arrows and Ctrl+N act on). */
 export function flattenGroups(groups: ResultGroup[]): GroupedResult[] {
   return groups.flatMap((g) => g.items);
 }

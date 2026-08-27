@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import {
   Search,
   Settings,
@@ -99,12 +100,11 @@ export function SearchBar({
     setViewMode(target);
     try {
       localStorage.setItem("localmind_view_mode", target);
-      const { getCurrentWindow, LogicalSize } = await import("@tauri-apps/api/window");
       const win = getCurrentWindow();
       if (target === "split") {
         await win.setSize(new LogicalSize(960, 580));
       } else {
-        await win.setSize(new LogicalSize(680, 560));
+        await win.setSize(new LogicalSize(720, 560));
       }
     } catch (err) {
       console.warn("Window resize error:", err);
@@ -122,7 +122,7 @@ export function SearchBar({
   const { indexStatus, stopIndexing } = useIndexStatus(sidecarPort);
 
   // Results are shown in sections; keyboard navigation walks the same order,
-  // so `ordered` — not the raw response — is what the arrow keys index into.
+  // so `ordered` (not the raw response) is what the arrow keys index into.
   const groups = useMemo(() => groupResults(results, activeTab), [results, activeTab]);
   const ordered = useMemo(() => flattenGroups(groups), [groups]);
 
@@ -141,19 +141,18 @@ export function SearchBar({
   // Re-focus input every time the window is shown (Ctrl+Space toggle)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) => {
-        const win = getCurrentWindow();
-        win.onFocusChanged(({ payload: focused }) => {
-          if (focused) {
-            // Small delay to ensure the window is fully visible
-            setTimeout(() => {
-              inputRef.current?.focus();
-            }, 50);
-          }
-        }).then((fn) => { unlisten = fn; });
-      })
-      .catch(() => {});
+    try {
+      const win = getCurrentWindow();
+      win.onFocusChanged(({ payload: focused }) => {
+        if (focused) {
+          setTimeout(() => {
+            inputRef.current?.focus();
+          }, 40);
+        }
+      }).then((fn) => { unlisten = fn; });
+    } catch {
+      /* Browser fallback */
+    }
     return () => { unlisten?.(); };
   }, []);
 
@@ -344,10 +343,12 @@ export function SearchBar({
           } else if (inputValue) {
             handleClear();
           } else {
-            // Input is already empty — hide the window
-            import("@tauri-apps/api/window")
-              .then(({ getCurrentWindow }) => getCurrentWindow().hide())
-              .catch(() => {});
+            // Input is already empty: hide the window
+            try {
+              getCurrentWindow().hide();
+            } catch {
+              /* Browser fallback */
+            }
           }
           break;
       }
@@ -358,11 +359,11 @@ export function SearchBar({
   return (
     <div
       className={`w-full rounded-2xl bg-white/90 dark:bg-neutral-900/90 backdrop-blur-2xl border border-black/10 dark:border-white/10 shadow-2xl overflow-hidden flex flex-col transition-all duration-200 ${
-        viewMode === "split" ? "max-w-5xl" : "max-w-2xl"
+        viewMode === "split" ? "max-w-5xl" : "max-w-3xl"
       }`}
     >
       {/* Search Input Bar */}
-      <div className="relative flex items-center gap-3 px-4 py-3.5 border-b border-black/5 dark:border-white/5">
+      <div className="relative flex items-center gap-2 sm:gap-2.5 px-3 py-2.5 sm:px-4 sm:py-3 border-b border-black/5 dark:border-white/5">
         <Search size={18} className="text-blue-500 shrink-0" />
 
         <input
@@ -372,14 +373,14 @@ export function SearchBar({
           onChange={(e) => handleInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={t("search.placeholder", "Search apps, files, content, math...")}
-          className="flex-1 bg-transparent text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-500 text-sm font-medium focus:outline-none"
+          className="flex-1 min-w-0 bg-transparent text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-500 text-sm font-medium focus:outline-none"
           autoFocus
         />
 
         {inputValue && (
           <button
             onClick={handleClear}
-            className="p-1 rounded-full text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 transition-colors"
+            className="p-1 shrink-0 rounded-full text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 transition-colors"
           >
             <X size={14} />
           </button>
@@ -390,7 +391,7 @@ export function SearchBar({
         {/* View Mode Toggle Button */}
         <button
           onClick={() => handleToggleViewMode()}
-          className={`p-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+          className={`p-1.5 shrink-0 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
             viewMode === "split"
               ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 font-semibold"
               : "text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800"
@@ -398,12 +399,12 @@ export function SearchBar({
           title={viewMode === "split" ? t("search.switchToCompact", "Switch to Compact Mode (Ctrl+B)") : t("search.switchToSplit", "Switch to Split View (Ctrl+B)")}
         >
           <Columns2 size={16} />
-          <span className="text-[11px] hidden sm:inline">{viewMode === "split" ? t("search.split", "Split") : t("search.compact", "Compact")}</span>
+          <span className="text-[11px] hidden md:inline">{viewMode === "split" ? t("search.split", "Split") : t("search.compact", "Compact")}</span>
         </button>
 
         <button
           onClick={onOpenSettings}
-          className="p-1.5 rounded-lg text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          className="p-1.5 shrink-0 rounded-lg text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
           title={t("settings.title", "Settings")}
         >
           <Settings size={16} />
@@ -596,7 +597,10 @@ export function SearchBar({
           lineStart={previewFile.line}
           icon={previewFile.icon}
           category={previewFile.category}
-          onClose={() => setPreviewFile(null)}
+          onClose={() => {
+            setPreviewFile(null);
+            setTimeout(() => inputRef.current?.focus(), 20);
+          }}
           onOpenFile={() => onOpenFile(previewFile.path)}
           onOpenFolder={onOpenFolder}
         />
@@ -606,7 +610,10 @@ export function SearchBar({
       {actionMenuTarget && (
         <ActionMenu
           isOpen={true}
-          onClose={() => setActionMenuTarget(null)}
+          onClose={() => {
+            setActionMenuTarget(null);
+            setTimeout(() => inputRef.current?.focus(), 20);
+          }}
           result={actionMenuTarget}
           onOpenFile={onOpenFile}
           onOpenFolder={onOpenFolder}

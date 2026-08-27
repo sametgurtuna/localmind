@@ -1,6 +1,7 @@
 mod apps;
 mod commands;
 mod elevation;
+mod git;
 mod mft_index;
 mod ntfs;
 mod sidecar;
@@ -79,14 +80,18 @@ pub fn run() {
                 }
             }
 
-            // Sync autostart registry entry if enabled
-            #[cfg(windows)]
+            // Sync autostart registry entry if enabled (only in release builds to avoid running debug binaries without Vite)
+            #[cfg(all(windows, not(debug_assertions)))]
             {
                 if config.autostart {
                     if let Ok(exe) = std::env::current_exe() {
                         let _ = commands::enable_windows_autostart("LocalMind", &exe.to_string_lossy(), &["--minimized", "--autostart"]);
                     }
                 }
+            }
+            #[cfg(all(windows, debug_assertions))]
+            {
+                let _ = commands::disable_windows_autostart("LocalMind");
             }
 
             Ok(())
@@ -117,6 +122,9 @@ pub fn run() {
             commands::update_global_shortcut,
             commands::set_autostart,
             commands::get_autostart,
+            commands::get_git_status,
+            commands::search_git_repos,
+            commands::open_git_remote,
         ])
         .build(tauri::generate_context!())
         .expect("error while running LocalMind")

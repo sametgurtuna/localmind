@@ -72,7 +72,7 @@ export function IndexProgress({ status, onStop }: IndexProgressProps) {
 
   const percent = Math.min(Math.max(status.progress, 0), 100);
   const eta = formatEta(status.etaSeconds);
-  // A file already up to date costs nothing to "index", so say so — otherwise a
+  // A file already up to date costs nothing to "index", so say so; otherwise a
   // run that races to 90% and then crawls looks broken.
   const fresh = Math.max(status.indexed - status.skipped, 0);
 

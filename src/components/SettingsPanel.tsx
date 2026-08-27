@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowLeft,
   Folder,
@@ -83,6 +84,20 @@ function SectionTitle({ children, icon }: { children: React.ReactNode; icon?: Re
   );
 }
 
+interface MftVolumeInfo {
+  drive_letter: string;
+  file_count: number;
+  is_mft: boolean;
+}
+
+interface MftStatusData {
+  status: string;
+  total_files: number;
+  total_apps: number;
+  scan_time_ms: number;
+  volumes: MftVolumeInfo[];
+}
+
 export function SettingsPanel({
   theme,
   onToggleTheme,
@@ -114,6 +129,14 @@ export function SettingsPanel({
   const [stats, setStats] = useState<IndexStats | null>(null);
   const [systemDrives, setSystemDrives] = useState<string[]>([]);
   const [libraryFolders, setLibraryFolders] = useState<string[]>([]);
+  const [mftStatus, setMftStatus] = useState<MftStatusData | null>(null);
+  const [rescanningDrives, setRescanningDrives] = useState(false);
+
+  const fetchMftStatus = () => {
+    invoke<MftStatusData>("get_mft_status")
+      .then((data) => setMftStatus(data))
+      .catch(() => {});
+  };
 
   useEffect(() => {
     const fetchStats = (p: number | null) => {
@@ -131,15 +154,25 @@ export function SettingsPanel({
     fetchStats(getSidecarPort());
     const unsub = subscribeSidecarPort((p) => fetchStats(p));
 
-    import("@tauri-apps/api/core")
-      .then(({ invoke }) => {
-        invoke<string[]>("get_system_drives").then(setSystemDrives).catch(() => {});
-        invoke<string[]>("get_default_folders").then(setLibraryFolders).catch(() => {});
-      })
-      .catch(() => {});
+    invoke<string[]>("get_system_drives").then(setSystemDrives).catch(() => {});
+    invoke<string[]>("get_default_folders").then(setLibraryFolders).catch(() => {});
+    fetchMftStatus();
 
     return unsub;
   }, []);
+
+  const handleRescanDrives = async () => {
+    setRescanningDrives(true);
+    try {
+      await invoke("refresh_mft_index");
+      setTimeout(() => {
+        fetchMftStatus();
+        setRescanningDrives(false);
+      }, 1200);
+    } catch {
+      setRescanningDrives(false);
+    }
+  };
 
   const handleAddPattern = () => {
     const p = newPattern.trim();
@@ -325,11 +358,74 @@ export function SettingsPanel({
 
         {tab === "indexing" && (
           <>
+            {/* 1. Instant MFT / Drive Search Section */}
+            <section className="p-3.5 rounded-xl bg-neutral-100/70 dark:bg-neutral-800/40 border border-black/5 dark:border-white/5 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Zap size={14} className="text-amber-500 shrink-0" />
+                  <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">
+                    {t("settings.instantDrives", "Instant Scanned Drives (0.001s Search)")}
+                  </span>
+                </div>
+                <button
+                  onClick={handleRescanDrives}
+                  disabled={rescanningDrives}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] rounded-lg bg-neutral-200/80 dark:bg-neutral-700/80 hover:bg-neutral-300 dark:hover:bg-neutral-600 text-neutral-700 dark:text-neutral-300 transition-colors font-medium cursor-pointer disabled:opacity-50"
+                  title={t("settings.rescanDrives", "Rescan All Drives")}
+                >
+                  <RefreshCw size={11} className={clsx(rescanningDrives && "animate-spin")} />
+                  <span>{rescanningDrives ? t("settings.rescanning", "Scanning...") : t("settings.rescanDrives", "Rescan Drives")}</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {mftStatus && mftStatus.volumes.length > 0 ? (
+                  mftStatus.volumes.map((vol) => (
+                    <div
+                      key={vol.drive_letter}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white dark:bg-neutral-800 border border-black/5 dark:border-white/5 shadow-xs"
+                    >
+                      <HardDrive size={13} className="text-blue-500 shrink-0" />
+                      <span className="text-xs font-bold font-mono text-neutral-900 dark:text-neutral-100">
+                        {vol.drive_letter}
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 font-medium">
+                        {vol.is_mft ? "NTFS MFT" : "Direct"}
+                      </span>
+                      <span className="text-[11px] text-neutral-500 dark:text-neutral-400 font-mono">
+                        {vol.file_count.toLocaleString()} files
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="flex items-center gap-2 text-xs text-neutral-400">
+                    <HardDrive size={13} />
+                    <span>C:\, D:\ (Ready for instant search)</span>
+                  </div>
+                )}
+              </div>
+
+              <p className="text-[11px] text-neutral-500 dark:text-neutral-400 leading-relaxed">
+                {t(
+                  "settings.instantDrivesDesc",
+                  "All hard drives (C:, D:, etc.) are scanned into memory on startup for instant file and app search without indexing delays.",
+                )}
+              </p>
+            </section>
+
+            <div className="h-px bg-neutral-100 dark:bg-neutral-800 my-1" />
+
+            {/* 2. Deep AI Content & Semantic Indexing */}
             <section>
               <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-medium text-neutral-500 dark:text-neutral-400">
-                  {t("settings.indexedFolders")}
-                </span>
+                <div>
+                  <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200 block">
+                    {t("settings.contentIndexing", "AI Deep Content & Semantic Indexing")}
+                  </span>
+                  <span className="text-[10px] text-neutral-400 dark:text-neutral-500 block">
+                    {t("settings.contentIndexingDesc", "Index full-text inside documents, code, and PDFs")}
+                  </span>
+                </div>
                 <button
                   onClick={onAddFolder}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-neutral-800 dark:bg-neutral-200 text-white dark:text-neutral-900 hover:bg-neutral-700 dark:hover:bg-neutral-300 transition-colors font-medium"

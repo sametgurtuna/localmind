@@ -1,5 +1,6 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import {
   ExternalLink,
   FolderOpen,
@@ -11,6 +12,7 @@ import {
   Star,
   Trash2,
   Sparkles,
+  Github,
   X,
 } from "lucide-react";
 import { clsx } from "clsx";
@@ -62,11 +64,22 @@ export function ActionMenu({
   const [selectedIndex, setSelectedIndex] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedIndex(0);
+      // Small timeout ensures the DOM node is rendered and ready for focus
+      setTimeout(() => {
+        containerRef.current?.focus();
+      }, 10);
+    }
+  }, [isOpen, result?.filePath]);
+
   if (!isOpen || !result) return null;
 
   const isApp = result.category === "app";
   const isCalc = result.category === "calc";
   const isAction = result.category === "action";
+  const isRepo = result.category === "repo";
 
   const actions: ActionItem[] = [];
 
@@ -78,6 +91,78 @@ export function ActionMenu({
       shortcut: "↵",
       onExecute: () => {
         onCopyPath(result.filePath);
+        onClose();
+      },
+    });
+  } else if (isRepo) {
+    // 1. Primary Action for Repos: Open in VS Code
+    actions.push({
+      id: "vscode",
+      label: t("results.openInVscode", "Open in VS Code"),
+      icon: <Code size={16} className="text-cyan-500" />,
+      shortcut: "↵",
+      onExecute: () => {
+        onOpenInVscode(result.filePath);
+        onClose();
+      },
+    });
+
+    // 2. Open in Terminal
+    actions.push({
+      id: "terminal",
+      label: t("results.openInTerminal", "Open in Terminal"),
+      icon: <Terminal size={16} className="text-purple-500" />,
+      shortcut: "Ctrl+Alt+T",
+      onExecute: () => {
+        onOpenInTerminal(result.filePath);
+        onClose();
+      },
+    });
+
+    // 3. Open on GitHub / Remote
+    actions.push({
+      id: "github",
+      label: t("results.openOnGithub", "View on GitHub / Remote"),
+      icon: <Github size={16} className="text-neutral-800 dark:text-neutral-200" />,
+      shortcut: "Ctrl+G",
+      onExecute: () => {
+        invoke("open_git_remote", { path: result.filePath }).catch(() => {});
+        onClose();
+      },
+    });
+
+    // 4. Open Folder in Explorer
+    actions.push({
+      id: "folder",
+      label: t("results.openFolder", "Show in Explorer"),
+      icon: <FolderOpen size={16} className="text-amber-500" />,
+      shortcut: "Ctrl+↵",
+      onExecute: () => {
+        onOpenFolder(result.filePath);
+        onClose();
+      },
+    });
+
+    // 5. Copy Path
+    actions.push({
+      id: "copy",
+      label: t("results.copyPath", "Copy Full Path"),
+      icon: <Copy size={16} className="text-emerald-500" />,
+      shortcut: "Ctrl+C",
+      onExecute: () => {
+        onCopyPath(result.filePath);
+        onClose();
+      },
+    });
+
+    // 6. Preview Dashboard
+    actions.push({
+      id: "preview",
+      label: "Workspace Dashboard",
+      icon: <Eye size={16} className="text-indigo-500" />,
+      shortcut: "Ctrl+P",
+      onExecute: () => {
+        onTogglePreview();
         onClose();
       },
     });

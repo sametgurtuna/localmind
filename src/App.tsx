@@ -1,5 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { SearchBar } from "./components/SearchBar";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useTheme } from "./hooks/useTheme";
@@ -20,13 +22,11 @@ import {
 type View = "search" | "settings";
 
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(cmd, args);
 }
 
 async function tauriListen(event: string, handler: () => void) {
   try {
-    const { listen } = await import("@tauri-apps/api/event");
     return listen(event, handler);
   } catch {
     return undefined;
@@ -337,7 +337,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="w-full h-full flex items-start justify-center p-3 sm:p-4 overflow-hidden select-none bg-transparent">
+    <div className="w-full h-full flex items-start justify-center p-2.5 sm:p-3 overflow-hidden select-none bg-transparent">
       {view === "search" ? (
         <SearchBar
           onOpenSettings={() => setView("settings")}

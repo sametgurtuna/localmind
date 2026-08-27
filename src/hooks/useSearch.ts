@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getSidecarPort, subscribeSidecarPort, setSidecarPort } from "../lib/api";
 import { parseConverterQuery, initRatesUpdater } from "../lib/converter";
 import { parseDirectUrl, parseWebShortcutQuery, getWebSearchFallbacks } from "../lib/webSearch";
@@ -16,7 +17,7 @@ export interface SearchResult {
   fileExt?: string;
   fileSize?: number;
   fileModified?: number;
-  category?: "calc" | "converter" | "web" | "app" | "file" | "content" | "action";
+  category?: "calc" | "converter" | "web" | "app" | "repo" | "file" | "content" | "action";
   action?: string;
   actionTitle?: string;
   icon?: string;
@@ -60,6 +61,7 @@ export function useSearch(portProp?: number | null) {
   });
   const portRef = useRef<number | null>(portProp || getSidecarPort());
   const abortRef = useRef<AbortController | null>(null);
+  const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeTabRef = useRef(state.activeTab);
   activeTabRef.current = state.activeTab;
 
@@ -79,6 +81,11 @@ export function useSearch(portProp?: number | null) {
   const search = useCallback(async (query: string, tab?: SearchTab) => {
     const q = query.trim();
     if (!q) {
+      if (aiDebounceTimerRef.current) {
+        clearTimeout(aiDebounceTimerRef.current);
+        aiDebounceTimerRef.current = null;
+      }
+      abortRef.current?.abort();
       setState((s) => ({ ...s, query, results: [], loading: false, error: null }));
       return;
     }
@@ -88,15 +95,25 @@ export function useSearch(portProp?: number | null) {
 
     const cached = getCached(cacheKey);
     if (cached) {
+      if (aiDebounceTimerRef.current) {
+        clearTimeout(aiDebounceTimerRef.current);
+        aiDebounceTimerRef.current = null;
+      }
+      abortRef.current?.abort();
       setState((s) => ({ ...s, query, results: cached, loading: false, error: null }));
       return;
     }
 
+    // Cancel any pending AI request or debounce timer
+    if (aiDebounceTimerRef.current) {
+      clearTimeout(aiDebounceTimerRef.current);
+      aiDebounceTimerRef.current = null;
+    }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
-    // Instant Tier 0: Converter, Direct URL, Web Search Shortcuts
+    // --- Tier 0: Instant Local Evaluators (0ms) ---
     const instantActions: SearchResult[] = [];
     if (searchTab === "all" || searchTab === "actions") {
       const convRes = parseConverterQuery(q);
@@ -111,19 +128,10 @@ export function useSearch(portProp?: number | null) {
 
     const webFallbacks = (searchTab === "all" || searchTab === "actions") ? getWebSearchFallbacks(q) : [];
 
-    // Keep showing previous results while loading (no flash of empty state)
-    const initialInstant = [...instantActions, ...webFallbacks];
-    if (initialInstant.length > 0) {
-      setState((s) => ({ ...s, query, results: initialInstant, loading: true, error: null }));
-    } else {
-      setState((s) => ({ ...s, query, loading: true, error: null }));
-    }
-
     let nativeMatched: SearchResult[] = [];
 
     // --- Tier 1: Instant Native Rust MFT & App Search (< 0.5ms) ---
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
       const nativeResults = await invoke<SearchResult[]>("fast_search_native", {
         query: q,
         filterType: searchTab,
@@ -132,101 +140,105 @@ export function useSearch(portProp?: number | null) {
 
       if (nativeResults && !controller.signal.aborted) {
         nativeMatched = nativeResults;
-        const instantMerged = [...instantActions, ...nativeResults, ...webFallbacks];
-        setState((s) => ({
-          ...s,
-          results: instantMerged,
-          loading: false,
-          error: null,
-        }));
-
-        // If top app, converter, or exact filename match on short query, return instantly
-        const bestScore = nativeResults[0]?.score ?? (instantActions.length > 0 ? 1.0 : 0);
-        const isShortQuery = q.split(/\s+/).length <= 2;
-        if (bestScore >= 0.98 && isShortQuery && searchTab !== "content") {
-          setCache(cacheKey, instantMerged);
-          return;
-        }
       }
     } catch {
       /* Browser fallback if running outside Tauri */
     }
 
-    // --- Tier 2: Asynchronous AI Semantic Content Search (20-40ms) ---
-    const currentPort = portRef.current || getSidecarPort();
-    if (!currentPort) {
-      const fallbackCombined = [...instantActions, ...nativeMatched, ...webFallbacks];
-      if (fallbackCombined.length > 0) {
-        setCache(cacheKey, fallbackCombined);
-      }
-      setState((s) => ({ ...s, results: fallbackCombined, loading: false }));
+    const instantMerged = [...instantActions, ...nativeMatched, ...webFallbacks];
+
+    // Show native + instant results immediately
+    setState((s) => ({
+      ...s,
+      query,
+      results: instantMerged,
+      loading: searchTab === "content" || (searchTab === "all" && q.length >= 3),
+      error: null,
+    }));
+
+    // If repo query, top app, converter, or exact filename match on short query, and user is not in "content" tab, cache & skip heavy AI
+    const qLower = q.toLowerCase();
+    const isRepoQuery =
+      qLower.startsWith("repo:") ||
+      qLower.startsWith("repo ") ||
+      qLower === "repo" ||
+      qLower.startsWith("git:") ||
+      qLower.startsWith("git ") ||
+      qLower === "git" ||
+      qLower.startsWith("project:") ||
+      qLower.startsWith("project ") ||
+      qLower === "project";
+
+    const bestScore = nativeMatched[0]?.score ?? (instantActions.length > 0 ? 1.0 : 0);
+    const isShortQuery = q.split(/\s+/).length <= 2;
+    if ((isRepoQuery || (bestScore >= 0.98 && isShortQuery)) && searchTab !== "content") {
+      setCache(cacheKey, instantMerged);
+      setState((s) => ({ ...s, loading: false }));
       return;
     }
 
-    try {
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
+    // --- Tier 2: Debounced AI Semantic Content Search (~180ms) ---
+    const currentPort = portRef.current || getSidecarPort();
+    if (!currentPort) {
+      setCache(cacheKey, instantMerged);
+      setState((s) => ({ ...s, loading: false }));
+      return;
+    }
 
-      const res = await fetch(`http://127.0.0.1:${currentPort}/search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, type: searchTab, limit: 25 }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!res.ok) throw new Error(`Search failed: ${res.status}`);
-
-      const data = await res.json();
-      if (!controller.signal.aborted) {
-        const sidecarResults: SearchResult[] = data.results ?? [];
-
-        // Merge instant + native + AI content + web fallbacks seamlessly
-        const existingPaths = new Set(
-          [...instantActions, ...nativeMatched].map((r) => r.filePath.toLowerCase()),
-        );
-        const middleResults: SearchResult[] = [...nativeMatched];
-
-        for (const item of sidecarResults) {
-          if (!existingPaths.has(item.filePath.toLowerCase())) {
-            middleResults.push(item);
-            existingPaths.add(item.filePath.toLowerCase());
-          }
-        }
-
-        middleResults.sort((a, b) => b.score - a.score);
-        const finalResults = [
-          ...instantActions,
-          ...middleResults.slice(0, 25),
-          ...webFallbacks,
-        ];
-
-        setCache(cacheKey, finalResults);
-        setState((s) => ({ ...s, results: finalResults, loading: false, error: null }));
-      }
-    } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
+    // Debounce the AI search request so fast typing doesn't spam ONNX embeddings
+    aiDebounceTimerRef.current = setTimeout(async () => {
       if (controller.signal.aborted) return;
 
-      const fallbackResults = [...instantActions, ...nativeMatched, ...webFallbacks];
-      if (fallbackResults.length > 0) {
-        setState((s) => ({ ...s, results: fallbackResults, loading: false, error: null }));
-        return;
+      try {
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+        const res = await fetch(`http://127.0.0.1:${currentPort}/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q, type: searchTab, limit: 25 }),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+
+        const data = await res.json();
+        if (!controller.signal.aborted) {
+          const sidecarResults: SearchResult[] = data.results ?? [];
+
+          // Merge instant + native + AI content + web fallbacks seamlessly
+          const existingPaths = new Set(
+            [...instantActions, ...nativeMatched].map((r) => r.filePath.toLowerCase()),
+          );
+          const middleResults: SearchResult[] = [...nativeMatched];
+
+          for (const item of sidecarResults) {
+            if (!existingPaths.has(item.filePath.toLowerCase())) {
+              middleResults.push(item);
+              existingPaths.add(item.filePath.toLowerCase());
+            }
+          }
+
+          middleResults.sort((a, b) => b.score - a.score);
+          const finalResults = [
+            ...instantActions,
+            ...middleResults.slice(0, 25),
+            ...webFallbacks,
+          ];
+
+          setCache(cacheKey, finalResults);
+          setState((s) => ({ ...s, results: finalResults, loading: false, error: null }));
+        }
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (controller.signal.aborted) return;
+
+        // On error, keep the instant/native results visible
+        setCache(cacheKey, instantMerged);
+        setState((s) => ({ ...s, results: instantMerged, loading: false }));
       }
-
-      const isNetworkFail = err instanceof TypeError && String(err.message).toLowerCase().includes("fetch");
-      const errorMsg = isNetworkFail
-        ? "AI Engine is connecting..."
-        : err instanceof Error
-        ? err.message
-        : "Search failed";
-
-      setState((s) => ({
-        ...s,
-        loading: false,
-        error: errorMsg,
-      }));
-    }
+    }, 180);
   }, []);
 
   const searchSimilar = useCallback(async (filePath: string) => {
@@ -261,6 +273,10 @@ export function useSearch(portProp?: number | null) {
   }, []);
 
   const clearSearch = useCallback(() => {
+    if (aiDebounceTimerRef.current) {
+      clearTimeout(aiDebounceTimerRef.current);
+      aiDebounceTimerRef.current = null;
+    }
     abortRef.current?.abort();
     setState((s) => ({
       query: "",

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   FileText,
   FolderOpen,
@@ -15,6 +16,10 @@ import {
   Globe,
   LayoutGrid,
   Sparkles,
+  GitBranch,
+  FolderGit2,
+  Github,
+  GitCommit,
 } from "lucide-react";
 import type { SearchResult } from "../hooks/useSearch";
 import hljs from "highlight.js/lib/core";
@@ -28,6 +33,9 @@ import json from "highlight.js/lib/languages/json";
 import markdown from "highlight.js/lib/languages/markdown";
 import xml from "highlight.js/lib/languages/xml";
 import css from "highlight.js/lib/languages/css";
+import sql from "highlight.js/lib/languages/sql";
+import yaml from "highlight.js/lib/languages/yaml";
+import bash from "highlight.js/lib/languages/bash";
 
 hljs.registerLanguage("javascript", javascript);
 hljs.registerLanguage("typescript", typescript);
@@ -38,6 +46,9 @@ hljs.registerLanguage("markdown", markdown);
 hljs.registerLanguage("html", xml);
 hljs.registerLanguage("xml", xml);
 hljs.registerLanguage("css", css);
+hljs.registerLanguage("sql", sql);
+hljs.registerLanguage("yaml", yaml);
+hljs.registerLanguage("bash", bash);
 
 const EXT_TO_LANG: Record<string, string> = {
   ".js": "javascript",
@@ -49,7 +60,15 @@ const EXT_TO_LANG: Record<string, string> = {
   ".json": "json",
   ".md": "markdown",
   ".html": "html",
+  ".xml": "xml",
   ".css": "css",
+  ".sql": "sql",
+  ".yaml": "yaml",
+  ".yml": "yaml",
+  ".sh": "bash",
+  ".bat": "bash",
+  ".ps1": "bash",
+  ".toml": "yaml",
 };
 
 interface SplitPreviewPanelProps {
@@ -70,6 +89,36 @@ interface NativePreview {
   file_ext: string;
   file_size?: number;
   modified?: number;
+}
+
+interface GitCommitInfo {
+  hash: string;
+  message: string;
+  author: string;
+  time_relative: string;
+}
+
+interface GitFileInfo {
+  path: string;
+  status: string;
+}
+
+interface GitRepoStatus {
+  name: string;
+  path: string;
+  branch: string;
+  remoteUrl?: string;
+  remoteWebUrl?: string;
+  ahead: number;
+  behind: number;
+  modifiedCount: number;
+  stagedCount: number;
+  untrackedCount: number;
+  isClean: boolean;
+  lastCommit?: GitCommitInfo;
+  recentCommits: GitCommitInfo[];
+  changedFiles: GitFileInfo[];
+  readmeSnippet?: string;
 }
 
 function formatBytes(bytes?: number): string {
@@ -106,26 +155,48 @@ export function SplitPreviewPanel({
   onCopyPath,
 }: SplitPreviewPanelProps) {
   const [nativeData, setNativeData] = useState<NativePreview | null>(null);
+  const [gitData, setGitData] = useState<GitRepoStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (!result) {
       setNativeData(null);
+      setGitData(null);
       return;
     }
 
     if (result.category === "calc" || result.category === "converter" || result.category === "web") {
       setNativeData(null);
+      setGitData(null);
       return;
     }
 
     let cancelled = false;
     setLoading(true);
 
+    if (result.category === "repo") {
+      async function loadGit() {
+        try {
+          const res = await invoke<GitRepoStatus | null>("get_git_status", {
+            path: result!.filePath,
+          });
+          if (!cancelled) {
+            setGitData(res);
+            setLoading(false);
+          }
+        } catch {
+          if (!cancelled) setLoading(false);
+        }
+      }
+      loadGit();
+      return () => {
+        cancelled = true;
+      };
+    }
+
     async function loadSnippet() {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
         const res = await invoke<NativePreview>("get_file_preview_native", {
           path: result!.filePath,
           line: result!.lineStart || 1,
@@ -153,6 +224,11 @@ export function SplitPreviewPanel({
     setTimeout(() => setCopied(false), 1500);
   };
 
+  const handleOpenRemote = () => {
+    if (!result) return;
+    invoke("open_git_remote", { path: result.filePath }).catch(() => {});
+  };
+
   if (!result) {
     return (
       <div className="h-full flex flex-col items-center justify-center p-6 text-center text-neutral-400 dark:text-neutral-600 select-none">
@@ -166,7 +242,8 @@ export function SplitPreviewPanel({
   const isConverter = result.category === "converter";
   const isWeb = result.category === "web";
   const isApp = result.category === "app";
-  const isFile = !isCalc && !isConverter && !isWeb && !isApp;
+  const isRepo = result.category === "repo";
+  const isFile = !isCalc && !isConverter && !isWeb && !isApp && !isRepo;
 
   const ext = (result.fileExt || result.fileName.split(".").pop() || "").toLowerCase();
   const isImage = ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"].includes(ext);
@@ -195,6 +272,8 @@ export function SplitPreviewPanel({
           <div className="p-2.5 rounded-xl bg-white dark:bg-neutral-800 shadow-sm border border-black/5 dark:border-white/5 shrink-0">
             {result.icon && result.icon.startsWith("data:") ? (
               <img src={result.icon} alt="" className="w-8 h-8 object-contain" />
+            ) : isRepo ? (
+              <FolderGit2 size={24} className="text-orange-500" />
             ) : isConverter ? (
               <ArrowRightLeft size={24} className="text-emerald-500" />
             ) : isCalc ? (
@@ -212,9 +291,11 @@ export function SplitPreviewPanel({
             <h3 className="text-sm font-bold text-neutral-900 dark:text-neutral-100 truncate leading-snug">
               {result.fileName}
             </h3>
-            <div className="flex items-center gap-2 mt-1">
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
               <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded-md bg-neutral-200/70 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300">
-                {isConverter
+                {isRepo
+                  ? "Git Repository"
+                  : isConverter
                   ? "Unit & Currency"
                   : isCalc
                   ? "Calculation"
@@ -224,6 +305,26 @@ export function SplitPreviewPanel({
                   ? "Application"
                   : ext.toUpperCase() || "File"}
               </span>
+
+              {isRepo && gitData && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-md bg-orange-500/15 text-orange-600 dark:text-orange-400">
+                  <GitBranch size={10} />
+                  {gitData.branch}
+                </span>
+              )}
+
+              {isRepo && gitData && (
+                <span
+                  className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${
+                    gitData.isClean
+                      ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                      : "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                  }`}
+                >
+                  {gitData.isClean ? "Clean" : `${gitData.changedFiles.length} uncommitted`}
+                </span>
+              )}
+
               {result.fileSize ? (
                 <span className="text-[11px] text-neutral-400 font-mono">
                   {formatBytes(result.fileSize)}
@@ -234,8 +335,90 @@ export function SplitPreviewPanel({
         </div>
 
         {/* 2. Middle Preview Area */}
-        <div className="w-full rounded-xl overflow-hidden border border-black/5 dark:border-white/10 bg-white dark:bg-neutral-950/80 shadow-xs min-h-[140px] max-h-[220px] flex flex-col">
-          {isConverter || isCalc ? (
+        <div className="w-full rounded-xl overflow-hidden border border-black/5 dark:border-white/10 bg-white dark:bg-neutral-950/80 shadow-xs min-h-[160px] max-h-[260px] flex flex-col">
+          {isRepo ? (
+            <div className="flex-1 overflow-auto p-3 text-xs flex flex-col gap-3">
+              {gitData?.remoteWebUrl && (
+                <div className="flex items-center justify-between gap-2 p-2 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-black/5 dark:border-white/5">
+                  <span className="text-[11px] font-mono text-neutral-600 dark:text-neutral-400 truncate flex items-center gap-1.5">
+                    <Github size={13} className="shrink-0" />
+                    {gitData.remoteWebUrl}
+                  </span>
+                  <button
+                    onClick={handleOpenRemote}
+                    className="text-[10px] text-blue-500 hover:text-blue-600 font-semibold shrink-0"
+                  >
+                    Open Remote
+                  </button>
+                </div>
+              )}
+
+              {/* Changed files section */}
+              {gitData?.changedFiles && gitData.changedFiles.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <span className="text-[11px] font-bold text-neutral-700 dark:text-neutral-300">
+                    Uncommitted Changes ({gitData.changedFiles.length})
+                  </span>
+                  <div className="flex flex-col gap-1 max-h-[90px] overflow-auto pr-1">
+                    {gitData.changedFiles.map((f, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center justify-between gap-2 text-[11px] font-mono py-0.5 px-1.5 rounded bg-neutral-50 dark:bg-neutral-900/60"
+                      >
+                        <span className="truncate text-neutral-600 dark:text-neutral-300">{f.path}</span>
+                        <span
+                          className={`text-[9px] font-bold px-1 rounded ${
+                            f.status === "M"
+                              ? "bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                              : f.status === "A"
+                              ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                              : f.status === "D"
+                              ? "bg-red-500/20 text-red-600 dark:text-red-400"
+                              : "bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                          }`}
+                        >
+                          {f.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Recent commits section */}
+              {gitData?.recentCommits && gitData.recentCommits.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <span className="text-[11px] font-bold text-neutral-700 dark:text-neutral-300 flex items-center gap-1">
+                    <GitCommit size={12} className="text-orange-500" />
+                    Recent Commits
+                  </span>
+                  <div className="flex flex-col gap-1.5">
+                    {gitData.recentCommits.slice(0, 3).map((c, i) => (
+                      <div key={i} className="flex flex-col text-[11px] py-1 px-1.5 rounded bg-neutral-50 dark:bg-neutral-900/40">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-neutral-800 dark:text-neutral-200 truncate">
+                            {c.message}
+                          </span>
+                          <span className="font-mono text-[10px] text-neutral-400 shrink-0">{c.hash}</span>
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-neutral-400 mt-0.5">
+                          <span>{c.author}</span>
+                          <span>{c.time_relative}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!gitData?.changedFiles?.length && !gitData?.recentCommits?.length && (
+                <div className="flex-1 flex flex-col items-center justify-center p-4 text-center text-neutral-400">
+                  <FolderGit2 size={24} className="mb-1 opacity-40 text-orange-500" />
+                  <span className="text-[11px]">{result.snippet || result.filePath}</span>
+                </div>
+              )}
+            </div>
+          ) : isConverter || isCalc ? (
             <div className="flex-1 flex flex-col items-center justify-center p-4 text-center">
               <span className="text-xs text-neutral-400 mb-1">Result</span>
               <span className="text-xl font-bold text-emerald-600 dark:text-emerald-400 font-mono">
@@ -299,12 +482,30 @@ export function SplitPreviewPanel({
       {/* 4. Action Buttons Footer */}
       <div className="flex flex-col gap-2 mt-4 pt-3 border-t border-black/5 dark:border-white/5">
         <button
-          onClick={() => onOpenFile(result.filePath)}
+          onClick={() => {
+            if (isRepo && onOpenInVscode) {
+              onOpenInVscode(result.filePath);
+            } else {
+              onOpenFile(result.filePath);
+            }
+          }}
           className="w-full py-2 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-medium text-xs flex items-center justify-center gap-2 shadow-sm transition-all"
         >
-          {isWeb ? <ExternalLink size={14} /> : isApp ? <LayoutGrid size={14} /> : isCalc || isConverter ? <Copy size={14} /> : <FileText size={14} />}
+          {isRepo ? (
+            <Code2 size={14} />
+          ) : isWeb ? (
+            <ExternalLink size={14} />
+          ) : isApp ? (
+            <LayoutGrid size={14} />
+          ) : isCalc || isConverter ? (
+            <Copy size={14} />
+          ) : (
+            <FileText size={14} />
+          )}
           <span>
-            {isWeb
+            {isRepo
+              ? "Open in VS Code (Enter)"
+              : isWeb
               ? "Open in Browser (Enter)"
               : isApp
               ? "Launch Application (Enter)"
@@ -315,7 +516,7 @@ export function SplitPreviewPanel({
         </button>
 
         <div className="flex items-center gap-1.5">
-          {onOpenFolder && isFile && (
+          {onOpenFolder && (isFile || isRepo) && (
             <button
               onClick={() => onOpenFolder(result.filePath)}
               className="flex-1 py-1.5 px-2 rounded-lg bg-neutral-150 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors"
@@ -337,7 +538,7 @@ export function SplitPreviewPanel({
             </button>
           )}
 
-          {onOpenInTerminal && isFile && (
+          {onOpenInTerminal && (isFile || isRepo) && (
             <button
               onClick={() => onOpenInTerminal(result.filePath)}
               className="flex-1 py-1.5 px-2 rounded-lg bg-neutral-150 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors"
@@ -345,6 +546,17 @@ export function SplitPreviewPanel({
             >
               <Terminal size={12} />
               <span>Terminal</span>
+            </button>
+          )}
+
+          {isRepo && gitData?.remoteWebUrl && (
+            <button
+              onClick={handleOpenRemote}
+              className="flex-1 py-1.5 px-2 rounded-lg bg-neutral-150 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors"
+              title="Open in GitHub / Remote"
+            >
+              <Github size={12} />
+              <span>GitHub</span>
             </button>
           )}
 
@@ -372,3 +584,4 @@ export function SplitPreviewPanel({
     </div>
   );
 }
+

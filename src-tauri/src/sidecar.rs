@@ -134,6 +134,30 @@ pub fn assign_pid_to_job(app: &AppHandle, pid: u32) {
     }
 }
 
+pub fn cleanup_stale_sidecars() {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = std::process::Command::new("taskkill")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/F", "/IM", "localmind-ai.exe", "/T"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f", "localmind-ai"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 pub fn kill_sidecar(app: &AppHandle) {
     let port = get_sidecar_port(app);
     if let Some(p) = port {
@@ -163,14 +187,23 @@ pub fn kill_sidecar(app: &AppHandle) {
                 let _ = std::process::Command::new("taskkill")
                     .creation_flags(CREATE_NO_WINDOW)
                     .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .spawn();
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
             #[cfg(not(target_os = "windows"))]
             {
                 let _ = std::process::Command::new("kill")
                     .args(["-9", &pid.to_string()])
-                    .spawn();
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
         }
     }
+
+    // Ensure any leftover localmind-ai.exe process tree is terminated
+    cleanup_stale_sidecars();
 }

@@ -9,7 +9,7 @@
 **Every file. Every word inside every file. Every app. In under a second. Fully offline.**
 
 <p>
-  <img src="https://img.shields.io/badge/VERSION-2.0.0-000000?style=for-the-badge&labelColor=000000" alt="Version 2.0.0" />
+  <img src="https://img.shields.io/badge/VERSION-2.0.3-000000?style=for-the-badge&labelColor=000000" alt="Version 2.0.3" />
   <img src="https://img.shields.io/badge/100%25-OFFLINE-22c55e?style=for-the-badge&labelColor=000000" alt="100% Offline" />
   <img src="https://img.shields.io/badge/1M%2B%20FILES-%3C1s-f97316?style=for-the-badge&labelColor=000000" alt="1M+ files in under 1s" />
   <img src="https://img.shields.io/badge/ZERO-TELEMETRY-3b82f6?style=for-the-badge&labelColor=000000" alt="Zero telemetry" />
@@ -81,7 +81,7 @@ A Rust engine reads the **NTFS Master File Table** directly via `FSCTL_ENUM_USN_
 
 ### Real understanding
 
-A local Python sidecar chunks and embeds the text inside your documents and code with a multilingual MiniLM model running on ONNX Runtime, so you can search by **meaning**, not just by file name — in English and Turkish alike.
+A local Python sidecar chunks and embeds the text inside your documents and code with a multilingual MiniLM model running on ONNX Runtime, so you can search by **meaning**, not just by file name (in English and Turkish alike).
 
 </td>
 <td width="33%" valign="top">
@@ -330,7 +330,7 @@ End to end on a mixed 900-file corpus (13,836 chunks): **70.8s → 45.3s, a 1.56
 |---|---|
 | **Arena-backed native index** | An MFT record used to own three separate `String`s (`name`, `name_lower`, `ext`). Names now live in one arena per volume and a record is a fixed 32-byte slice reference; the extension is derived on demand. **~65 MB less per million files**, and zero heap allocations per file instead of three. |
 | **Bounded search result selection** | A broad query used to collect *every* match before sorting it. Only the best candidates are kept now, which bounds both the allocation and the sort. |
-| **Streaming folder scan** | The scan yields entries instead of materializing one record per candidate file. On a re-index, unchanged files cost a single path string rather than a full entry — **~33 MB less at 150k files**. |
+| **Streaming folder scan** | The scan yields entries instead of materializing one record per candidate file. On a re-index, unchanged files cost a single path string rather than a full entry (**~33 MB less at 150k files**). |
 | **Released hash cache** | The path-to-hash map that answers "has this file changed?" is dropped when a run finishes and rebuilt lazily on the next one, instead of sitting resident for the life of the sidecar. |
 | **Memory-balanced batch size** | The inference batch is the main memory dial, since activations scale with batch size. 32 measured within 10% of 64 while holding 24 MB less, so it is the default. |
 

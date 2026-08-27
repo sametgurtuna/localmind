@@ -21,6 +21,8 @@ import {
   BookOpen,
   ExternalLink,
   Bot,
+  GitBranch,
+  FolderGit2,
 } from "lucide-react";
 import { clsx } from "clsx";
 import type { SearchResult, SearchTab } from "../hooks/useSearch";
@@ -112,6 +114,9 @@ function getResultIcon(result: SearchResult) {
       />
     );
   }
+  if (result.category === "repo" || result.icon === "git") {
+    return <FolderGit2 size={18} className="text-orange-500 shrink-0" />;
+  }
   if (result.category === "converter") {
     return <ArrowRightLeft size={18} className="text-emerald-500 shrink-0" />;
   }
@@ -191,6 +196,7 @@ function ResultRow({
   const isConverter = result.category === "converter";
   const isWeb = result.category === "web";
   const isApp = result.category === "app";
+  const isRepo = result.category === "repo";
   const isContent = result.category === "content";
 
   return (
@@ -199,7 +205,7 @@ function ResultRow({
       role="option"
       aria-selected={isSelected}
       onClick={onOpen}
-      onMouseMove={onSelect}
+      onMouseEnter={onSelect}
       className={clsx(
         "group relative flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl cursor-pointer select-none",
         "transition-colors duration-100",
@@ -226,10 +232,18 @@ function ResultRow({
                 isCalc && "font-mono text-base text-amber-600 dark:text-amber-400",
                 isConverter && "text-[14px] font-bold text-emerald-600 dark:text-emerald-400",
                 isWeb && "text-blue-600 dark:text-blue-400",
+                isRepo && "text-neutral-900 dark:text-neutral-100 font-bold",
               )}
             >
               {highlightMatch(result.fileName, query)}
             </span>
+
+            {isRepo && (
+              <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-md bg-orange-500/15 text-orange-600 dark:text-orange-400 font-medium">
+                <GitBranch size={11} />
+                Workspace
+              </span>
+            )}
 
             {isConverter && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">
@@ -254,7 +268,7 @@ function ResultRow({
                 {highlightMatch(result.snippet, query)}
               </span>
             ) : (
-              <span>{result.snippet || result.filePath}</span>
+              <span className={clsx(isRepo && "text-neutral-600 dark:text-neutral-300 font-medium")}>{result.snippet || result.filePath}</span>
             )}
           </div>
         </div>

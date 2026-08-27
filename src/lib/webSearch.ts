@@ -245,7 +245,23 @@ export function getWebSearchFallbacks(query: string): SearchResult[] {
   if (!q || q.length < 2) return [];
 
   // Filter out any commands/special prefixes
-  if (q.startsWith(">") || q.startsWith(":") || q.startsWith("!")) return [];
+  const qLower = q.toLowerCase();
+  if (
+    q.startsWith(">") ||
+    q.startsWith(":") ||
+    q.startsWith("!") ||
+    qLower.startsWith("repo:") ||
+    qLower.startsWith("repo ") ||
+    qLower === "repo" ||
+    qLower.startsWith("git:") ||
+    qLower.startsWith("git ") ||
+    qLower === "git" ||
+    qLower.startsWith("project:") ||
+    qLower.startsWith("project ") ||
+    qLower === "project"
+  ) {
+    return [];
+  }
 
   return [
     {

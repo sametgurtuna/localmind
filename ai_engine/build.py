@@ -125,6 +125,7 @@ def build():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
+        "--noconsole",
         "--name", output_name,
         "--distpath", dist_dir,
         "--workpath", os.path.join(script_dir, "build"),
