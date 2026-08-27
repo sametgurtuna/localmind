@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "LocalMind",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "identifier": "com.localmind.desktop",
   "build": {
     "frontendDist": "../dist",

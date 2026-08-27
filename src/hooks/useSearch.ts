@@ -62,6 +62,7 @@ export function useSearch(portProp?: number | null) {
   const portRef = useRef<number | null>(portProp || getSidecarPort());
   const abortRef = useRef<AbortController | null>(null);
   const aiDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchSeqRef = useRef<number>(0);
   const activeTabRef = useRef(state.activeTab);
   activeTabRef.current = state.activeTab;
 
@@ -80,6 +81,8 @@ export function useSearch(portProp?: number | null) {
 
   const search = useCallback(async (query: string, tab?: SearchTab) => {
     const q = query.trim();
+    const currentSeq = ++searchSeqRef.current;
+
     if (!q) {
       if (aiDebounceTimerRef.current) {
         clearTimeout(aiDebounceTimerRef.current);
@@ -138,11 +141,19 @@ export function useSearch(portProp?: number | null) {
         limit: 25,
       });
 
-      if (nativeResults && !controller.signal.aborted) {
+      if (currentSeq !== searchSeqRef.current || controller.signal.aborted) {
+        return;
+      }
+
+      if (nativeResults) {
         nativeMatched = nativeResults;
       }
     } catch {
       /* Browser fallback if running outside Tauri */
+    }
+
+    if (currentSeq !== searchSeqRef.current || controller.signal.aborted) {
+      return;
     }
 
     const instantMerged = [...instantActions, ...nativeMatched, ...webFallbacks];
@@ -204,7 +215,7 @@ export function useSearch(portProp?: number | null) {
         if (!res.ok) throw new Error(`Search failed: ${res.status}`);
 
         const data = await res.json();
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && currentSeq === searchSeqRef.current) {
           const sidecarResults: SearchResult[] = data.results ?? [];
 
           // Merge instant + native + AI content + web fallbacks seamlessly

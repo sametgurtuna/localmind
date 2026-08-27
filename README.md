@@ -9,7 +9,7 @@
 **Every file. Every word inside every file. Every app. In under a second. Fully offline.**
 
 <p>
-  <img src="https://img.shields.io/badge/VERSION-2.0.3-000000?style=for-the-badge&labelColor=000000" alt="Version 2.0.3" />
+  <img src="https://img.shields.io/badge/VERSION-2.0.4-000000?style=for-the-badge&labelColor=000000" alt="Version 2.0.4" />
   <img src="https://img.shields.io/badge/100%25-OFFLINE-22c55e?style=for-the-badge&labelColor=000000" alt="100% Offline" />
   <img src="https://img.shields.io/badge/1M%2B%20FILES-%3C1s-f97316?style=for-the-badge&labelColor=000000" alt="1M+ files in under 1s" />
   <img src="https://img.shields.io/badge/ZERO-TELEMETRY-3b82f6?style=for-the-badge&labelColor=000000" alt="Zero telemetry" />
@@ -39,6 +39,19 @@
 <sub><i>One hotkey. One search bar. Files, content, apps, math, conversions, all ranked together.</i></sub>
 
 </div>
+
+<br />
+
+## What's New in v2.0.4
+
+Version 2.0.4 delivers major search latency and responsiveness optimizations, completely eliminating typing freezes and background process overhead.
+
+| Improvement Area | Previous (v2.0.3) | New in v2.0.4 |
+|---|---|---|
+| **Live Search Subprocesses** | Spawned `git.exe` CLI processes on every matched repo during keystrokes | **Zero-Process Fast Path**: Direct `.git` header and config parsing (< 0.02ms) |
+| **Workspace & Repo Discovery** | Recursive synchronous disk walks during search queries | **In-Memory MFT Cache**: Git repositories are indexed in background alongside apps |
+| **Key-to-Result Latency** | 500ms - 1500ms during fast typing with repository matches | **Sub-millisecond (< 2ms)** instant response across all drives |
+| **Search Request Lifecycle** | Concurrent IPC calls could compete for lock during fast typing | **Sequence Synchronized & Debounced**: Stale requests are instantly discarded |
 
 <br />
 

@@ -116,6 +116,7 @@ impl VolumeData {
 pub struct MftIndex {
     pub volumes: Vec<VolumeData>,
     pub apps: Vec<AppItem>,
+    pub git_repos: Vec<crate::git::GitRepoSummary>,
     pub total_files: usize,
     pub status: String,
     pub scan_time_ms: u64,
@@ -128,6 +129,7 @@ impl MftIndex {
         Self {
             volumes: Vec::new(),
             apps: Vec::new(),
+            git_repos: Vec::new(),
             total_files: 0,
             status: "uninitialized".to_string(),
             scan_time_ms: 0,
@@ -227,12 +229,9 @@ impl MftIndex {
 
             let repo_term_lower = term.trim();
             let p_chars: Vec<char> = repo_term_lower.chars().collect();
-            let discovered_paths = crate::git::discover_git_repositories(&[]);
 
-            for repo_path in discovered_paths {
-                let name = repo_path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
-                let name_lower = name.to_lowercase();
-
+            for repo in &self.git_repos {
+                let name_lower = repo.name.to_lowercase();
                 let score = if repo_term_lower.is_empty() {
                     0.95
                 } else if name_lower == repo_term_lower {
@@ -246,23 +245,10 @@ impl MftIndex {
                 };
 
                 if score > 0.60 {
-                    let path_str = repo_path.to_string_lossy().to_string();
-                    let status = crate::git::get_git_repo_status(&path_str);
-                    let snippet = if let Some(ref st) = status {
-                        let dirty_text = if st.is_clean {
-                            "Clean".to_string()
-                        } else {
-                            format!("{} uncommitted changes", st.changed_files.len())
-                        };
-                        let last_msg = st.last_commit.as_ref().map_or("".to_string(), |c| format!(" · \"{}\" ({})", c.message, c.time_relative));
-                        format!("🌿 {} · {}{}", st.branch, dirty_text, last_msg)
-                    } else {
-                        path_str.clone()
-                    };
-
+                    let snippet = format!("🌿 {} · {}", repo.branch, repo.path);
                     results.push(NativeSearchResult {
-                        file_name: name.clone(),
-                        file_path: path_str,
+                        file_name: repo.name.clone(),
+                        file_path: repo.path.clone(),
                         snippet,
                         score: score + 0.05, // Give repos a slight boost
                         file_ext: None,
@@ -270,13 +256,13 @@ impl MftIndex {
                         file_modified: None,
                         category: "repo".to_string(),
                         action: "open_in_vscode".to_string(),
-                        action_title: format!("Open {} in VS Code", name),
+                        action_title: format!("Open {} in VS Code", repo.name),
                         icon: Some("git".to_string()),
                     });
                 }
             }
 
-            if is_explicit_repo_query && (!repo_term_lower.is_empty() || results.len() > 0) {
+            if is_explicit_repo_query && (!repo_term_lower.is_empty() || !results.is_empty()) {
                 results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
                 return results.into_iter().take(limit).collect();
             }
@@ -285,10 +271,8 @@ impl MftIndex {
         // 2b. In general search ("all"), also search discovered git repositories
         if filter_type == "all" && !is_explicit_repo_query && q_lower.len() >= 2 {
             let p_chars: Vec<char> = q_lower.chars().collect();
-            let discovered_paths = crate::git::discover_git_repositories(&[]);
-            for repo_path in discovered_paths {
-                let name = repo_path.file_name().map_or("".to_string(), |n| n.to_string_lossy().to_string());
-                let name_lower = name.to_lowercase();
+            for repo in &self.git_repos {
+                let name_lower = repo.name.to_lowercase();
                 let score = if name_lower == q_lower {
                     1.0
                 } else if name_lower.starts_with(&q_lower) {
@@ -300,23 +284,10 @@ impl MftIndex {
                 };
 
                 if score > 0.70 {
-                    let path_str = repo_path.to_string_lossy().to_string();
-                    let status = crate::git::get_git_repo_status(&path_str);
-                    let snippet = if let Some(ref st) = status {
-                        let dirty_text = if st.is_clean {
-                            "Clean".to_string()
-                        } else {
-                            format!("{} uncommitted changes", st.changed_files.len())
-                        };
-                        let last_msg = st.last_commit.as_ref().map_or("".to_string(), |c| format!(" · \"{}\" ({})", c.message, c.time_relative));
-                        format!("🌿 {} · {}{}", st.branch, dirty_text, last_msg)
-                    } else {
-                        path_str.clone()
-                    };
-
+                    let snippet = format!("🌿 {} · {}", repo.branch, repo.path);
                     results.push(NativeSearchResult {
-                        file_name: name.clone(),
-                        file_path: path_str,
+                        file_name: repo.name.clone(),
+                        file_path: repo.path.clone(),
                         snippet,
                         score: score + 0.02,
                         file_ext: None,
@@ -324,7 +295,7 @@ impl MftIndex {
                         file_modified: None,
                         category: "repo".to_string(),
                         action: "open_in_vscode".to_string(),
-                        action_title: format!("Open {} in VS Code", name),
+                        action_title: format!("Open {} in VS Code", repo.name),
                         icon: Some("git".to_string()),
                     });
                 }
@@ -450,16 +421,12 @@ impl MftIndex {
                 let mut icon = None;
 
                 if is_dir {
-                    let path_obj = std::path::Path::new(&full_path);
-                    if crate::git::is_git_repo(path_obj) {
+                    if let Some(repo) = self.git_repos.iter().find(|r| r.path.eq_ignore_ascii_case(&full_path)) {
                         category = "repo".to_string();
                         action = "open_in_vscode".to_string();
                         action_title = format!("Open {} in VS Code", name);
                         icon = Some("git".to_string());
-                        if let Some(st) = crate::git::get_git_repo_status(&full_path) {
-                            let dirty_str = if st.is_clean { "Clean".to_string() } else { format!("{} uncommitted changes", st.changed_files.len()) };
-                            snippet = format!("🌿 {} · {}", st.branch, dirty_str);
-                        }
+                        snippet = format!("🌿 {} · {}", repo.branch, full_path);
                     }
                 }
 
@@ -860,6 +827,10 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
         let apps = scan_windows_apps();
         log::info!("Found {} Windows applications & system tools", apps.len());
 
+        // 1b. Discover and cache Git Repositories in background
+        let git_repos = crate::git::discover_and_cache_git_repos(&[]);
+        log::info!("Found {} Git repositories across workspace & dev directories", git_repos.len());
+
         // 2. Scan All Storage Volumes (C:\, D:\, E:\, etc.)
         let mut volumes_data = Vec::new();
         let mut total_files = 0;
@@ -941,6 +912,7 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
         if let Ok(mut idx) = shared_index.write() {
             idx.volumes = volumes_data;
             idx.apps = apps;
+            idx.git_repos = git_repos;
             idx.total_files = total_files;
             idx.status = "ready".to_string();
             idx.scan_time_ms = elapsed.as_millis() as u64;

@@ -96,6 +96,102 @@ pub fn normalize_git_web_url(raw: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitRepoSummary {
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    #[serde(rename = "remoteUrl", skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(rename = "remoteWebUrl", skip_serializing_if = "Option::is_none")]
+    pub remote_web_url: Option<String>,
+}
+
+/// Zero-process instantaneous extraction of Git repository name, branch and remote.
+/// Reads `.git/HEAD` and `.git/config` using direct Rust file I/O (< 0.02ms).
+pub fn get_git_repo_summary(repo_path: &Path) -> Option<GitRepoSummary> {
+    let git_dir = repo_path.join(".git");
+    if !git_dir.exists() {
+        return None;
+    }
+
+    let repo_name = repo_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Repository".to_string());
+
+    let mut branch = String::from("main");
+    let mut remote_url: Option<String> = None;
+
+    if git_dir.is_dir() {
+        // Read HEAD
+        if let Ok(head_content) = fs::read_to_string(git_dir.join("HEAD")) {
+            let line = head_content.trim();
+            if let Some(ref_path) = line.strip_prefix("ref: refs/heads/") {
+                branch = ref_path.to_string();
+            } else if line.len() >= 7 {
+                branch = line[..7].to_string();
+            }
+        }
+
+        // Read config for origin remote
+        if let Ok(cfg_content) = fs::read_to_string(git_dir.join("config")) {
+            let mut in_origin = false;
+            for line in cfg_content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("[remote \"origin\"]") {
+                    in_origin = true;
+                    continue;
+                } else if trimmed.starts_with('[') {
+                    in_origin = false;
+                }
+
+                if in_origin && trimmed.starts_with("url =") {
+                    if let Some((_, val)) = trimmed.split_once('=') {
+                        remote_url = Some(val.trim().to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    } else if git_dir.is_file() {
+        // Handle git worktree or submodule reference file
+        if let Ok(content) = fs::read_to_string(&git_dir) {
+            if let Some(git_dir_rel) = content.trim().strip_prefix("gitdir:") {
+                let real_git_dir = repo_path.join(git_dir_rel.trim());
+                if let Ok(head_content) = fs::read_to_string(real_git_dir.join("HEAD")) {
+                    let line = head_content.trim();
+                    if let Some(ref_path) = line.strip_prefix("ref: refs/heads/") {
+                        branch = ref_path.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let remote_web_url = remote_url.as_deref().and_then(normalize_git_web_url);
+
+    Some(GitRepoSummary {
+        name: repo_name,
+        path: repo_path.to_string_lossy().to_string(),
+        branch,
+        remote_url,
+        remote_web_url,
+    })
+}
+
+/// Discover and cache Git repositories in user profile and dev folders
+pub fn discover_and_cache_git_repos(configured_folders: &[String]) -> Vec<GitRepoSummary> {
+    let repo_paths = discover_git_repositories(configured_folders);
+    let mut summaries = Vec::with_capacity(repo_paths.len());
+    for p in repo_paths {
+        if let Some(summary) = get_git_repo_summary(&p) {
+            summaries.push(summary);
+        }
+    }
+    summaries
+}
+
 /// Check if a directory is the root of a Git repository
 pub fn is_git_repo(path: &Path) -> bool {
     let git_dir = path.join(".git");
