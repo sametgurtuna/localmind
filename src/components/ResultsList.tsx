@@ -23,6 +23,12 @@ import {
   Bot,
   GitBranch,
   FolderGit2,
+  Lock,
+  Moon,
+  RotateCw,
+  Power,
+  Trash2,
+  Wifi,
 } from "lucide-react";
 import { clsx } from "clsx";
 import type { SearchResult, SearchTab } from "../hooks/useSearch";
@@ -129,10 +135,16 @@ function getResultIcon(result: SearchResult) {
     if (result.icon === "chatgpt") return <Bot size={18} className="text-emerald-500 shrink-0" />;
     return <Globe size={18} className="text-blue-500 shrink-0" />;
   }
-  if (result.category === "calc") {
+  if (result.category === "calc" || result.icon === "calc") {
     return <Calculator size={18} className="text-amber-500 shrink-0" />;
   }
   if (result.category === "action") {
+    if (result.icon === "lock") return <Lock size={18} className="text-amber-500 shrink-0" />;
+    if (result.icon === "sleep") return <Moon size={18} className="text-indigo-400 shrink-0" />;
+    if (result.icon === "restart") return <RotateCw size={18} className="text-sky-500 shrink-0" />;
+    if (result.icon === "shutdown") return <Power size={18} className="text-rose-500 shrink-0" />;
+    if (result.icon === "trash") return <Trash2 size={18} className="text-red-500 shrink-0" />;
+    if (result.icon === "network" || result.icon === "ip") return <Wifi size={18} className="text-emerald-500 shrink-0" />;
     return <Zap size={18} className="text-purple-500 shrink-0" />;
   }
   if (result.category === "app") {

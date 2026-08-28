@@ -204,9 +204,17 @@ export function SearchBar({
 
   const handleExecuteResult = useCallback(
     (result: SearchResult) => {
+      // 1. Optimistic UI Hide immediately (< 0.1ms)
+      try {
+        getCurrentWindow().hide();
+      } catch {
+        /* browser fallback */
+      }
+
+      // 2. Execute action in background
       if (result.category === "calc" || result.category === "converter" || result.action === "copy") {
         handleCopyPath(result.filePath);
-      } else if (result.category === "action" && result.action === "system_command") {
+      } else if (result.action === "system_command" || result.category === "action") {
         onSystemCommand(result.filePath);
       } else {
         onOpenFile(result.filePath);

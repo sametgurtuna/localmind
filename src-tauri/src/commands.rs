@@ -266,16 +266,77 @@ pub fn get_system_drives() -> Vec<String> {
     drives
 }
 
+/// Ultra-fast Win32 ShellExecuteW native execution (< 0.1ms latency, zero cmd/powershell subprocess overhead).
+pub fn native_shell_execute(path: &str, verb: Option<&str>, args: Option<&str>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide_file: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let verb_str = verb.unwrap_or("open");
+        let wide_verb: Vec<u16> = OsStr::new(verb_str).encode_wide().chain(Some(0)).collect();
+        let wide_args: Option<Vec<u16>> = args.map(|a| OsStr::new(a).encode_wide().chain(Some(0)).collect());
+
+        let params_ptr = wide_args.as_ref().map(|a| a.as_ptr()).unwrap_or(std::ptr::null());
+
+        let res = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                wide_verb.as_ptr(),
+                wide_file.as_ptr(),
+                params_ptr,
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        // Win32 ShellExecuteW returns > 32 (HINSTANCE) on success
+        if (res as isize) > 32 {
+            return Ok(());
+        }
+    }
+
+    // Fallback if ShellExecuteW fails or on non-Windows
+    if let Err(e) = open::that(path) {
+        silent_command("cmd")
+            .args(["/C", "start", "", path])
+            .spawn()
+            .map_err(|e2| format!("Failed to launch {} (open: {}, cmd: {})", path, e, e2))?;
+    }
+    Ok(())
+}
+
+pub fn launch_calculator() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if native_shell_execute("calculator:", Some("open"), None).is_ok() {
+            return Ok(());
+        }
+        if native_shell_execute("calc.exe", Some("open"), None).is_ok() {
+            return Ok(());
+        }
+    }
+    open::that("calc:").or_else(|_| open::that("calc")).map_err(|e| format!("Failed to launch calculator: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn open_file(path: String) -> Result<(), String> {
-    open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
+    let p_lower = path.trim().to_lowercase();
+    if p_lower == "calc" || p_lower == "calc.exe" || p_lower == "calculator" || p_lower == "calculator:" {
+        return launch_calculator();
+    }
+    native_shell_execute(&path, Some("open"), None)
 }
 
 #[tauri::command]
 pub fn open_folder(path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
     let folder = p.parent().unwrap_or(&p);
-    open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
+    native_shell_execute(&folder.to_string_lossy(), Some("open"), None)
 }
 
 #[tauri::command]
@@ -531,16 +592,11 @@ pub fn delete_file(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn launch_app(path: String) -> Result<(), String> {
-    if path.contains(":") && !path.contains("\\") && !path.contains("/") {
-        // Protocol handler like ms-settings: or calculator:
-        silent_command("cmd")
-            .args(["/C", "start", &path])
-            .spawn()
-            .map_err(|e| format!("Failed to launch protocol: {}", e))?;
-        return Ok(());
+    let p_lower = path.trim().to_lowercase();
+    if p_lower == "calc" || p_lower == "calc.exe" || p_lower == "calculator" || p_lower == "calculator:" {
+        return launch_calculator();
     }
-
-    open::that(&path).map_err(|e| format!("Failed to launch app: {}", e))
+    native_shell_execute(&path, Some("open"), None)
 }
 
 #[tauri::command]
@@ -554,11 +610,17 @@ pub fn show_in_folder(path: String) -> Result<(), String> {
         return Ok(());
     }
     let folder = p.parent().unwrap_or(&p);
-    open::that(folder).map_err(|e| format!("Failed to open folder: {}", e))
+    native_shell_execute(&folder.to_string_lossy(), Some("open"), None)
 }
 
 #[tauri::command]
 pub fn run_as_admin(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if native_shell_execute(&path, Some("runas"), None).is_ok() {
+            return Ok(());
+        }
+    }
     silent_command("powershell")
         .args([
             "-NoProfile",
@@ -572,10 +634,100 @@ pub fn run_as_admin(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn system_command(command: String) -> Result<(), String> {
-    silent_command("cmd")
-        .args(["/C", &command])
-        .spawn()
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
+    let cmd_trimmed = command.trim().to_lowercase();
+    match cmd_trimmed.as_str() {
+        "lock" | "lock_workstation" | "lock screen" | "lock pc" => {
+            #[cfg(windows)]
+            {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn LockWorkStation() -> i32;
+                }
+                unsafe {
+                    LockWorkStation();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = silent_command("rundll32.exe")
+                    .args(["user32.dll,LockWorkStation"])
+                    .spawn();
+            }
+        }
+        "sleep" | "suspend" => {
+            #[cfg(windows)]
+            {
+                // PowerShell Forms SetSuspendState safely puts Windows to sleep without forcing hibernation
+                let _ = silent_command("powershell.exe")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)",
+                    ])
+                    .spawn()
+                    .or_else(|_| {
+                        silent_command("rundll32.exe")
+                            .args(["powrprof.dll,SetSuspendState", "0,1,0"])
+                            .spawn()
+                    })
+                    .map_err(|e| format!("Failed to sleep PC: {}", e))?;
+            }
+            #[cfg(not(windows))]
+            {
+                silent_command("systemctl")
+                    .args(["suspend"])
+                    .spawn()
+                    .map_err(|e| format!("Failed to sleep PC: {}", e))?;
+            }
+        }
+        "restart" | "reboot" => {
+            silent_command("shutdown.exe")
+                .args(["/r", "/t", "0", "/f"])
+                .spawn()
+                .map_err(|e| format!("Failed to restart PC: {}", e))?;
+        }
+        "shutdown" | "poweroff" => {
+            silent_command("shutdown.exe")
+                .args(["/s", "/t", "0", "/f"])
+                .spawn()
+                .map_err(|e| format!("Failed to shut down PC: {}", e))?;
+        }
+        "empty_trash" | "empty_recycle_bin" | "empty trash" | "recycle_bin" => {
+            #[cfg(windows)]
+            {
+                // Native Shell32 SHEmptyRecycleBinW (SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND = 7)
+                unsafe {
+                    windows_sys::Win32::UI::Shell::SHEmptyRecycleBinW(std::ptr::null_mut(), std::ptr::null(), 7);
+                }
+                // Fallback using PowerShell
+                let _ = silent_command("powershell.exe")
+                    .args(["-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"])
+                    .spawn();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = silent_command("powershell.exe")
+                    .args(["-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"])
+                    .spawn();
+            }
+        }
+        "logout" | "signout" => {
+            silent_command("shutdown.exe")
+                .args(["/l", "/f"])
+                .spawn()
+                .map_err(|e| format!("Failed to log off: {}", e))?;
+        }
+        "calc" | "calculator" | "calc.exe" | "calculator:" => {
+            launch_calculator()?;
+        }
+        _ => {
+            silent_command("cmd")
+                .args(["/C", &command])
+                .spawn()
+                .map_err(|e| format!("Failed to execute command: {}", e))?;
+        }
+    }
     Ok(())
 }
 

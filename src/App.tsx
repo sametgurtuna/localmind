@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SearchBar } from "./components/SearchBar";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useTheme } from "./hooks/useTheme";
@@ -113,68 +114,78 @@ export default function App() {
     });
   }, []);
 
-  const handleOpenFile = useCallback(async (filePath: string) => {
+  const handleOpenFile = useCallback((filePath: string) => {
+    try {
+      getCurrentWindow().hide();
+    } catch {
+      /* browser fallback */
+    }
     const name = filePath.split(/[\\/]/).pop() ?? filePath;
     setConfig((prev) => {
       const next = addRecentFile(prev, filePath, name);
       saveConfig(next);
       return next;
     });
-    try {
-      if (filePath.endsWith(".lnk") || filePath.endsWith(".exe") || (filePath.includes(":") && !filePath.includes("\\"))) {
-        await tauriInvoke("launch_app", { path: filePath });
-      } else {
-        await tauriInvoke("open_file", { path: filePath });
-      }
-    } catch {
-      window.open(`file://${filePath}`);
+    if (filePath.endsWith(".lnk") || filePath.endsWith(".exe") || (filePath.includes(":") && !filePath.includes("\\"))) {
+      tauriInvoke("launch_app", { path: filePath }).catch(() => {
+        window.open(`file://${filePath}`);
+      });
+    } else {
+      tauriInvoke("open_file", { path: filePath }).catch(() => {
+        window.open(`file://${filePath}`);
+      });
     }
   }, []);
 
-  const handleOpenFolder = useCallback(async (filePath: string) => {
+  const handleOpenFolder = useCallback((filePath: string) => {
     try {
-      await tauriInvoke("show_in_folder", { path: filePath });
+      getCurrentWindow().hide();
     } catch {
-      try {
-        await tauriInvoke("open_folder", { path: filePath });
-      } catch {
+      /* browser fallback */
+    }
+    tauriInvoke("show_in_folder", { path: filePath }).catch(() => {
+      tauriInvoke("open_folder", { path: filePath }).catch(() => {
         const sep = filePath.includes("\\") ? "\\" : "/";
         const folder = filePath.substring(0, filePath.lastIndexOf(sep));
         window.open(`file://${folder}`);
-      }
-    }
+      });
+    });
   }, []);
 
-  const handleOpenInVscode = useCallback(async (path: string) => {
+  const handleOpenInVscode = useCallback((path: string) => {
     try {
-      await tauriInvoke("open_in_vscode", { path });
+      getCurrentWindow().hide();
     } catch {
-      /* noop */
+      /* browser fallback */
     }
+    tauriInvoke("open_in_vscode", { path }).catch(() => {});
   }, []);
 
-  const handleOpenInTerminal = useCallback(async (path: string) => {
+  const handleOpenInTerminal = useCallback((path: string) => {
     try {
-      await tauriInvoke("open_in_terminal", { path });
+      getCurrentWindow().hide();
     } catch {
-      /* noop */
+      /* browser fallback */
     }
+    tauriInvoke("open_in_terminal", { path }).catch(() => {});
   }, []);
 
-  const handleRunAsAdmin = useCallback(async (path: string) => {
+  const handleRunAsAdmin = useCallback((path: string) => {
     try {
-      await tauriInvoke("run_as_admin", { path });
+      getCurrentWindow().hide();
     } catch {
-      /* noop */
+      /* browser fallback */
     }
+    tauriInvoke("run_as_admin", { path }).catch(() => {});
   }, []);
 
-  const handleSystemCommand = useCallback(async (command: string) => {
+  const handleSystemCommand = useCallback((command: string) => {
     try {
-      await tauriInvoke("system_command", { command });
+      getCurrentWindow().hide();
     } catch {
-      /* noop */
+      /* browser fallback */
     }
+    tauriInvoke("system_command", { command }).catch(() => {});
   }, []);
 
   const handleDeleteFile = useCallback(async (path: string) => {

@@ -111,7 +111,18 @@
     "ocr": "Görsellerdeki metni oku (OCR)",
     "ocrDesc": "Ekran görüntüsü, fotoğraf ve taranmış PDF'lerdeki metni de indeksler. ~500 MB model yükler ve görsel başına birkaç saniye ekler.",
     "rebuildRequiredNote": "Embedding modeli değişti. Aramanın yenisini kullanması için indeksi yeniden kurun.",
-    "rebuildSuggestedNote": "Daha önce atlanan içeriğin dahil olması için indeksi yeniden kurun."
+    "rebuildSuggestedNote": "Daha önce atlanan içeriğin dahil olması için indeksi yeniden kurun.",
+    "updates": "Sürüm & Güncellemeler",
+    "currentVersion": "Mevcut Sürüm",
+    "checkForUpdates": "Güncellemeleri Denetle",
+    "checkingUpdates": "Denetleniyor...",
+    "upToDate": "LocalMind Güncel",
+    "upToDateDesc": "En son sürümü (v{{version}}) kullanıyorsunuz.",
+    "updateAvailable": "Yeni Sürüm Mevcut",
+    "updateAvailableDesc": "Yeni bir sürüm yayınlandı (v{{version}}). İndirmek için tıklayın.",
+    "downloadUpdate": "Güncellemeyi İndir",
+    "viewReleaseNotes": "Sürüm Notlarını Gör",
+    "updateCheckFailed": "Güncelleme denetlenemedi. İnternet bağlantınızı kontrol edin."
   },
   "index": {
     "progress": "İndeksleniyor: {{percent}}%",

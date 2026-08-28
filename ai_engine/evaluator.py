@@ -137,44 +137,62 @@ def evaluate_quick_query(query: str) -> list[dict]:
         "lock": {
             "title": "Lock Workstation",
             "desc": "Lock current Windows session (Win + L)",
-            "cmd": "rundll32.exe user32.dll,LockWorkStation",
+            "cmd": "lock",
         },
         "sleep": {
             "title": "Sleep PC",
             "desc": "Put computer into sleep mode",
-            "cmd": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+            "cmd": "sleep",
         },
         "restart": {
             "title": "Restart Computer",
             "desc": "Reboot Windows operating system",
-            "cmd": "shutdown /r /t 0",
+            "cmd": "restart",
         },
         "shutdown": {
             "title": "Shut Down Computer",
             "desc": "Turn off Windows computer",
-            "cmd": "shutdown /s /t 0",
+            "cmd": "shutdown",
         },
         "empty trash": {
             "title": "Empty Recycle Bin",
             "desc": "Permanently delete items in Recycle Bin",
-            "cmd": "powershell.exe -NoProfile -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+            "cmd": "empty_trash",
         },
         "recycle bin": {
             "title": "Empty Recycle Bin",
             "desc": "Permanently delete items in Recycle Bin",
-            "cmd": "powershell.exe -NoProfile -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+            "cmd": "empty_trash",
+        },
+        "calc": {
+            "title": "Calculator",
+            "desc": "Open Windows Calculator",
+            "cmd": "calc",
+            "category": "app",
+            "action": "open",
+            "actionTitle": "Open Calculator",
+        },
+        "calculator": {
+            "title": "Calculator",
+            "desc": "Open Windows Calculator",
+            "cmd": "calc",
+            "category": "app",
+            "action": "open",
+            "actionTitle": "Open Calculator",
         },
         "ip": {
             "title": f"Local IP: {_get_local_ip()}",
             "desc": "Copy your local network IPv4 address",
             "cmd": _get_local_ip(),
             "action": "copy",
+            "actionTitle": "Copy IP Address",
         },
         "my ip": {
             "title": f"Local IP: {_get_local_ip()}",
             "desc": "Copy your local network IPv4 address",
             "cmd": _get_local_ip(),
             "action": "copy",
+            "actionTitle": "Copy IP Address",
         },
     }
 
@@ -185,9 +203,9 @@ def evaluate_quick_query(query: str) -> list[dict]:
                 "filePath": info["cmd"],
                 "snippet": info["desc"],
                 "score": 0.98 if q_lower == key else 0.85,
-                "category": "action",
+                "category": info.get("category", "action"),
                 "action": info.get("action", "system_command"),
-                "actionTitle": "Execute" if info.get("action") != "copy" else "Copy IP",
+                "actionTitle": info.get("actionTitle", "Execute Action" if info.get("action") != "copy" else "Copy IP Address"),
             })
 
     return results

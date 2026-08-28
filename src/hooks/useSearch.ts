@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getSidecarPort, subscribeSidecarPort, setSidecarPort } from "../lib/api";
 import { parseConverterQuery, initRatesUpdater } from "../lib/converter";
 import { parseDirectUrl, parseWebShortcutQuery, getWebSearchFallbacks } from "../lib/webSearch";
+import { parseMathQuery, parseSystemAction } from "../lib/quickActions";
 
 export { setSidecarPort };
 
@@ -50,6 +51,8 @@ function setCache(key: string, results: SearchResult[]) {
   }
   searchCache.set(key, { results, ts: Date.now() });
 }
+
+const appIconCache = new Map<string, string>();
 
 export function useSearch(portProp?: number | null) {
   const [state, setState] = useState<SearchState>({
@@ -119,6 +122,12 @@ export function useSearch(portProp?: number | null) {
     // --- Tier 0: Instant Local Evaluators (0ms) ---
     const instantActions: SearchResult[] = [];
     if (searchTab === "all" || searchTab === "actions") {
+      const mathRes = parseMathQuery(q);
+      if (mathRes) instantActions.push(mathRes);
+
+      const sysActions = parseSystemAction(q);
+      if (sysActions.length > 0) instantActions.push(...sysActions);
+
       const convRes = parseConverterQuery(q);
       if (convRes) instantActions.push(convRes);
 
@@ -146,6 +155,14 @@ export function useSearch(portProp?: number | null) {
       }
 
       if (nativeResults) {
+        // Reuse and populate in-memory Icon Cache to prevent IPC/memory bloat
+        for (const item of nativeResults) {
+          if (item.icon) {
+            appIconCache.set(item.filePath, item.icon);
+          } else if (appIconCache.has(item.filePath)) {
+            item.icon = appIconCache.get(item.filePath);
+          }
+        }
         nativeMatched = nativeResults;
       }
     } catch {
@@ -156,18 +173,17 @@ export function useSearch(portProp?: number | null) {
       return;
     }
 
-    const instantMerged = [...instantActions, ...nativeMatched, ...webFallbacks];
+    const seen = new Set<string>();
+    const instantMerged: SearchResult[] = [];
+    for (const item of [...instantActions, ...nativeMatched, ...webFallbacks]) {
+      const key = `${item.category || ""}:${item.fileName}:${item.filePath}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        instantMerged.push(item);
+      }
+    }
 
-    // Show native + instant results immediately
-    setState((s) => ({
-      ...s,
-      query,
-      results: instantMerged,
-      loading: searchTab === "content" || (searchTab === "all" && q.length >= 3),
-      error: null,
-    }));
-
-    // If repo query, top app, converter, or exact filename match on short query, and user is not in "content" tab, cache & skip heavy AI
+    // Check whether heavy Python AI semantic search is actually needed
     const qLower = q.toLowerCase();
     const isRepoQuery =
       qLower.startsWith("repo:") ||
@@ -180,9 +196,37 @@ export function useSearch(portProp?: number | null) {
       qLower.startsWith("project ") ||
       qLower === "project";
 
-    const bestScore = nativeMatched[0]?.score ?? (instantActions.length > 0 ? 1.0 : 0);
-    const isShortQuery = q.split(/\s+/).length <= 2;
-    if ((isRepoQuery || (bestScore >= 0.98 && isShortQuery)) && searchTab !== "content") {
+    const topMatch = nativeMatched[0];
+    const topCategory = topMatch?.category;
+    const topScore = topMatch?.score ?? (instantActions.length > 0 ? 1.0 : 0);
+
+    const isAppOrActionTab = searchTab === "apps" || searchTab === "actions" || searchTab === "files";
+    const hasInstantAction = instantActions.length > 0;
+    const hasHighConfidenceApp = (topCategory === "app" || topCategory === "repo" || topCategory === "action") && topScore >= 0.85;
+    const hasExactFileMatch = topScore >= 0.95 && q.length <= 4;
+    const isPrefixFilter = qLower.startsWith("*.") || qLower.startsWith("ext:") || qLower.startsWith("dir:");
+    const isShortGenericQuery = q.length < 3 && searchTab !== "content";
+
+    const shouldSkipAiSearch =
+      searchTab !== "content" &&
+      (isAppOrActionTab ||
+        hasInstantAction ||
+        isRepoQuery ||
+        hasHighConfidenceApp ||
+        hasExactFileMatch ||
+        isPrefixFilter ||
+        isShortGenericQuery);
+
+    // Show native + instant results immediately
+    setState((s) => ({
+      ...s,
+      query,
+      results: instantMerged,
+      loading: !shouldSkipAiSearch && (searchTab === "content" || (searchTab === "all" && q.length >= 3)),
+      error: null,
+    }));
+
+    if (shouldSkipAiSearch) {
       setCache(cacheKey, instantMerged);
       setState((s) => ({ ...s, loading: false }));
       return;

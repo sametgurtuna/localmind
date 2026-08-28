@@ -14,6 +14,7 @@ import {
   Sparkles,
   Github,
   X,
+  Zap,
 } from "lucide-react";
 import { clsx } from "clsx";
 import type { SearchResult } from "../hooks/useSearch";
@@ -84,16 +85,29 @@ export function ActionMenu({
   const actions: ActionItem[] = [];
 
   if (isCalc || isAction) {
-    actions.push({
-      id: "copy",
-      label: result.actionTitle || "Copy Result",
-      icon: <Copy size={16} className="text-amber-500" />,
-      shortcut: "↵",
-      onExecute: () => {
-        onCopyPath(result.filePath);
-        onClose();
-      },
-    });
+    if (result.action === "system_command") {
+      actions.push({
+        id: "execute",
+        label: result.actionTitle || "Execute Action",
+        icon: <Zap size={16} className="text-purple-500" />,
+        shortcut: "↵",
+        onExecute: () => {
+          invoke("system_command", { command: result.filePath }).catch(() => {});
+          onClose();
+        },
+      });
+    } else {
+      actions.push({
+        id: "copy",
+        label: result.actionTitle || "Copy Result",
+        icon: <Copy size={16} className="text-amber-500" />,
+        shortcut: "↵",
+        onExecute: () => {
+          onCopyPath(result.filePath);
+          onClose();
+        },
+      });
+    }
   } else if (isRepo) {
     // 1. Primary Action for Repos: Open in VS Code
     actions.push({

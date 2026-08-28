@@ -182,10 +182,19 @@ impl MftIndex {
 
         let mut results = Vec::with_capacity(limit + 5);
 
-        // 1. Quick Math calculation (instant < 0.1ms)
+        // 1. Quick Math calculation (instant < 0.05ms)
         if let Some(calc_res) = evaluate_math(q) {
             results.push(calc_res);
             if filter_type == "actions" || filter_type == "calc" {
+                return results;
+            }
+        }
+
+        // 2. Quick System Actions (lock, sleep, restart, shutdown, empty trash, my ip, etc.)
+        let sys_actions = evaluate_system_actions(q);
+        for action in sys_actions {
+            results.push(action);
+            if filter_type == "actions" {
                 return results;
             }
         }
@@ -641,73 +650,621 @@ pub fn fuzzy_match_score(pattern: &str, target: &str) -> f64 {
 }
 
 
-/// Simple safe math evaluator for calculations like "150 * 4" or "1024 / 8"
-fn evaluate_math(q: &str) -> Option<NativeSearchResult> {
-    let clean = q.replace(',', ".").replace('x', "*").replace('X', "*");
-    let trimmed = clean.trim();
-
-    // Check if query contains math operators
-    if !trimmed.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '%')) {
-        return None;
+pub fn get_local_ip() -> String {
+    for target in &["8.8.8.8:80", "1.1.1.1:80", "192.168.1.1:80", "10.0.0.1:80", "172.16.0.1:80"] {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(target).is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    let ip_str = addr.ip().to_string();
+                    if ip_str != "0.0.0.0" && ip_str != "127.0.0.1" {
+                        return ip_str;
+                    }
+                }
+            }
+        }
     }
-
-    // Only allow digits, math operators, dots, spaces, parens
-    if !trimmed.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '^' | '%' | '.' | ' ' | '(' | ')')) {
-        return None;
-    }
-
-    // Evaluate basic arithmetic
-    let result_str = eval_simple_expr(trimmed)?;
-
-    Some(NativeSearchResult {
-        file_name: format!("= {}", result_str),
-        file_path: result_str.clone(),
-        snippet: format!("Result: {}", result_str),
-        score: 1.0,
-        file_ext: None,
-        file_size: None,
-        file_modified: None,
-        category: "calc".to_string(),
-        action: "copy".to_string(),
-        action_title: "Copy Calculation Result".to_string(),
-        icon: None,
-    })
+    "127.0.0.1".to_string()
 }
 
-fn eval_simple_expr(expr: &str) -> Option<String> {
-    // Basic safe parser for 2-operand or simple expressions
-    let tokens: Vec<&str> = expr.split_whitespace().collect();
-    if tokens.len() == 3 {
-        let left: f64 = tokens[0].parse().ok()?;
-        let op = tokens[1];
-        let right: f64 = tokens[2].parse().ok()?;
+pub fn evaluate_system_actions(q: &str) -> Vec<NativeSearchResult> {
+    let q_lower = q.trim().to_lowercase();
+    if q_lower.is_empty() {
+        return Vec::new();
+    }
 
-        let res = match op {
-            "+" => left + right,
-            "-" => left - right,
-            "*" => left * right,
-            "/" => {
-                if right == 0.0 {
-                    return None;
+    let mut actions = Vec::new();
+    let local_ip = get_local_ip();
+
+    struct ActionSpec {
+        keys: &'static [&'static str],
+        title: &'static str,
+        cmd: &'static str,
+        desc: &'static str,
+        category: &'static str,
+        action: &'static str,
+        action_title: &'static str,
+        icon: &'static str,
+    }
+
+    let specs = [
+        ActionSpec {
+            keys: &["lock", "lock screen", "lock workstation", "lock pc", "kilit", "kilitle", "ekranı kilitle", "ekrani kilitle", "ekran kilidi"],
+            title: "Lock Workstation",
+            cmd: "lock",
+            desc: "Lock current Windows session (Win + L)",
+            category: "action",
+            action: "system_command",
+            action_title: "Lock Screen",
+            icon: "lock",
+        },
+        ActionSpec {
+            keys: &["sleep", "sleep pc", "suspend", "uyku", "uyut", "uyku modu", "askıya al", "askiya al"],
+            title: "Sleep PC",
+            cmd: "sleep",
+            desc: "Put computer into sleep mode",
+            category: "action",
+            action: "system_command",
+            action_title: "Sleep",
+            icon: "sleep",
+        },
+        ActionSpec {
+            keys: &["restart", "reboot", "restart pc", "yeniden başlat", "yeniden baslat", "bilgisayarı yeniden başlat", "bilgisayari yeniden baslat", "reset"],
+            title: "Restart Computer",
+            cmd: "restart",
+            desc: "Reboot Windows operating system",
+            category: "action",
+            action: "system_command",
+            action_title: "Restart",
+            icon: "restart",
+        },
+        ActionSpec {
+            keys: &["shutdown", "shut down", "power off", "turn off", "kapat", "bilgisayarı kapat", "bilgisayari kapat", "bilgisayar kapat"],
+            title: "Shut Down Computer",
+            cmd: "shutdown",
+            desc: "Turn off Windows computer",
+            category: "action",
+            action: "system_command",
+            action_title: "Shut Down",
+            icon: "shutdown",
+        },
+        ActionSpec {
+            keys: &[
+                "empty trash", "empty recycle bin", "recycle bin", "trash",
+                "çöpü boşalt", "copu bosalt", "çöp kutusu", "cop kutusu",
+                "çöp kutusunu boşalt", "cop kutusunu bosalt", "geri dönüşüm kutusu", "geri donusum kutusu",
+            ],
+            title: "Empty Recycle Bin",
+            cmd: "empty_trash",
+            desc: "Permanently delete items in Recycle Bin",
+            category: "action",
+            action: "system_command",
+            action_title: "Empty Recycle Bin",
+            icon: "trash",
+        },
+        ActionSpec {
+            keys: &["my ip", "ip", "local ip", "ip address", "ip adresi", "ip adresim", "yerel ip", "what is my ip", "benim ip", "ip nedir"],
+            title: "Local IP Address",
+            cmd: "ip_copy",
+            desc: "Copy your local network IPv4 address",
+            category: "action",
+            action: "copy",
+            action_title: "Copy IP Address",
+            icon: "network",
+        },
+        ActionSpec {
+            keys: &["logout", "log out", "sign out", "signout", "oturum kapat", "oturumu kapat"],
+            title: "Sign Out",
+            cmd: "logout",
+            desc: "Sign out of current user session",
+            category: "action",
+            action: "system_command",
+            action_title: "Sign Out",
+            icon: "logout",
+        },
+        ActionSpec {
+            keys: &["calc", "calculator", "hesap makinesi", "hesap makinasi", "hesap", "hesap makinası"],
+            title: "Calculator",
+            cmd: "calc",
+            desc: "Open Windows Calculator",
+            category: "app",
+            action: "open",
+            action_title: "Open Calculator",
+            icon: "calc",
+        },
+    ];
+
+    for spec in specs {
+        let is_exact = spec.keys.iter().any(|&k| k == q_lower);
+        let is_prefix = !is_exact && spec.keys.iter().any(|&k| k.starts_with(&q_lower) || (q_lower.len() >= 3 && k.contains(&q_lower)));
+
+        if is_exact || is_prefix {
+            let (file_name, file_path, snippet) = if spec.cmd == "ip_copy" {
+                (
+                    format!("Local IP: {}", local_ip),
+                    local_ip.clone(),
+                    format!("Your local network IPv4 address ({})", local_ip),
+                )
+            } else {
+                (
+                    spec.title.to_string(),
+                    spec.cmd.to_string(),
+                    spec.desc.to_string(),
+                )
+            };
+
+            actions.push(NativeSearchResult {
+                file_name,
+                file_path,
+                snippet,
+                score: if is_exact { 1.0 } else { 0.95 },
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: spec.category.to_string(),
+                action: spec.action.to_string(),
+                action_title: spec.action_title.to_string(),
+                icon: Some(spec.icon.to_string()),
+            });
+        }
+    }
+
+    actions
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum MathToken {
+    Num(f64),
+    Ident(String),
+    Op(char),
+    LParen,
+    RParen,
+    Comma,
+}
+
+fn tokenize_math(input: &str) -> Option<Vec<MathToken>> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let len = chars.len();
+
+    while i < len {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        if c.is_ascii_digit() || c == '.' {
+            let start = i;
+            let mut has_dot = c == '.';
+            i += 1;
+            while i < len {
+                let next_c = chars[i];
+                if next_c.is_ascii_digit() {
+                    i += 1;
+                } else if next_c == '.' && !has_dot {
+                    has_dot = true;
+                    i += 1;
+                } else {
+                    break;
                 }
-                left / right
             }
-            "%" => left % right,
-            "^" => left.powf(right),
-            _ => return None,
-        };
+            let s: String = chars[start..i].iter().collect();
+            let n: f64 = s.parse().ok()?;
+            tokens.push(MathToken::Num(n));
+            continue;
+        }
 
-        return Some(format_num(res));
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect::<String>().to_lowercase();
+            match ident.as_str() {
+                "pi" => tokens.push(MathToken::Num(std::f64::consts::PI)),
+                "e" => tokens.push(MathToken::Num(std::f64::consts::E)),
+                "tau" => tokens.push(MathToken::Num(std::f64::consts::TAU)),
+                _ => tokens.push(MathToken::Ident(ident)),
+            }
+            continue;
+        }
+
+        match c {
+            '+' | '-' | '*' | '/' | '%' | '^' => {
+                tokens.push(MathToken::Op(c));
+                i += 1;
+            }
+            'x' | 'X' => {
+                tokens.push(MathToken::Op('*'));
+                i += 1;
+            }
+            '(' => {
+                tokens.push(MathToken::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(MathToken::RParen);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(MathToken::Comma);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(tokens)
+}
+
+struct MathParser {
+    tokens: Vec<MathToken>,
+    pos: usize,
+}
+
+impl MathParser {
+    fn new(tokens: Vec<MathToken>) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&MathToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<MathToken> {
+        if self.pos < self.tokens.len() {
+            let tok = self.tokens[self.pos].clone();
+            self.pos += 1;
+            Some(tok)
+        } else {
+            None
+        }
+    }
+
+    fn parse_expression(&mut self) -> Option<f64> {
+        let mut left = self.parse_term()?;
+
+        while let Some(MathToken::Op(op)) = self.peek() {
+            if *op == '+' || *op == '-' {
+                let op_char = *op;
+                self.next();
+                let right = self.parse_term()?;
+                left = match op_char {
+                    '+' => left + right,
+                    '-' => left - right,
+                    _ => unreachable!(),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Some(left)
+    }
+
+    fn parse_term(&mut self) -> Option<f64> {
+        let mut left = self.parse_power()?;
+
+        while let Some(MathToken::Op(op)) = self.peek() {
+            if *op == '*' || *op == '/' || *op == '%' {
+                let op_char = *op;
+                self.next();
+                let right = self.parse_power()?;
+                left = match op_char {
+                    '*' => left * right,
+                    '/' => {
+                        if right == 0.0 {
+                            return None;
+                        }
+                        left / right
+                    }
+                    '%' => {
+                        if right == 0.0 {
+                            return None;
+                        }
+                        left % right
+                    }
+                    _ => unreachable!(),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Some(left)
+    }
+
+    fn parse_power(&mut self) -> Option<f64> {
+        let base = self.parse_factor()?;
+
+        if let Some(MathToken::Op('^')) = self.peek() {
+            self.next();
+            let exp = self.parse_power()?;
+            return Some(base.powf(exp));
+        }
+
+        Some(base)
+    }
+
+    fn parse_factor(&mut self) -> Option<f64> {
+        match self.peek()? {
+            MathToken::Op('+') => {
+                self.next();
+                self.parse_factor()
+            }
+            MathToken::Op('-') => {
+                self.next();
+                Some(-self.parse_factor()?)
+            }
+            MathToken::Num(n) => {
+                let val = *n;
+                self.next();
+                Some(val)
+            }
+            MathToken::Ident(id) => {
+                let func_name = id.clone();
+                self.next();
+                if let Some(MathToken::LParen) = self.peek() {
+                    self.next();
+                    let arg = self.parse_expression()?;
+                    let arg2 = if let Some(MathToken::Comma) = self.peek() {
+                        self.next();
+                        Some(self.parse_expression()?)
+                    } else {
+                        None
+                    };
+                    if let Some(MathToken::RParen) = self.peek() {
+                        self.next();
+                    } else {
+                        return None;
+                    }
+
+                    match func_name.as_str() {
+                        "sqrt" => Some(arg.sqrt()),
+                        "cbrt" => Some(arg.cbrt()),
+                        "sin" => Some(arg.to_radians().sin()),
+                        "cos" => Some(arg.to_radians().cos()),
+                        "tan" => Some(arg.to_radians().tan()),
+                        "asin" => Some(arg.asin().to_degrees()),
+                        "acos" => Some(arg.acos().to_degrees()),
+                        "atan" => Some(arg.atan().to_degrees()),
+                        "abs" => Some(arg.abs()),
+                        "log" | "log10" => Some(arg.log10()),
+                        "log2" => Some(arg.log2()),
+                        "ln" => Some(arg.ln()),
+                        "exp" => Some(arg.exp()),
+                        "round" => Some(arg.round()),
+                        "floor" => Some(arg.floor()),
+                        "ceil" => Some(arg.ceil()),
+                        "pow" => Some(arg.powf(arg2.unwrap_or(1.0))),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            MathToken::LParen => {
+                self.next();
+                let val = self.parse_expression()?;
+                if let Some(MathToken::RParen) = self.peek() {
+                    self.next();
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn evaluate_math(q: &str) -> Option<NativeSearchResult> {
+    let mut raw = q.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Strip leading `= `, `calc `, `calculator `, `hesap `
+    let raw_lower = raw.to_lowercase();
+    if let Some(rest) = raw_lower.strip_prefix("calc ") {
+        raw = raw[raw.len() - rest.len()..].trim();
+    } else if let Some(rest) = raw_lower.strip_prefix("calculator ") {
+        raw = raw[raw.len() - rest.len()..].trim();
+    } else if let Some(rest) = raw_lower.strip_prefix("hesap ") {
+        raw = raw[raw.len() - rest.len()..].trim();
+    } else if let Some(rest) = raw.strip_prefix('=') {
+        raw = rest.trim();
+    }
+
+    if let Some(rest) = raw.strip_suffix('=') {
+        raw = rest.trim();
+    }
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    // 1. Percentage check: "20% of 500" or "15% * 80"
+    let clean = raw.replace(',', ".");
+    let parts: Vec<&str> = clean.split_whitespace().collect();
+    if parts.len() == 3 && (parts[1].eq_ignore_ascii_case("of") || parts[1] == "*") {
+        if parts[0].ends_with('%') {
+            let pct_str = &parts[0][..parts[0].len() - 1];
+            if let (Ok(pct), Ok(total)) = (pct_str.parse::<f64>(), parts[2].parse::<f64>()) {
+                let res = (pct / 100.0) * total;
+                let res_str = format_num(res);
+                return Some(NativeSearchResult {
+                    file_name: format!("= {}", res_str),
+                    file_path: res_str.clone(),
+                    snippet: format!("Calculation: {} = {}", raw, res_str),
+                    score: 1.0,
+                    file_ext: None,
+                    file_size: None,
+                    file_modified: None,
+                    category: "calc".to_string(),
+                    action: "copy".to_string(),
+                    action_title: "Copy Result".to_string(),
+                    icon: Some("calc".to_string()),
+                });
+            }
+        }
+    }
+
+    // Percentage additions / subtractions e.g. "500 + 20%" or "500 - 10%"
+    if parts.len() == 3 && (parts[1] == "+" || parts[1] == "-") && parts[2].ends_with('%') {
+        let pct_str = &parts[2][..parts[2].len() - 1];
+        if let (Ok(base), Ok(pct)) = (parts[0].parse::<f64>(), pct_str.parse::<f64>()) {
+            let delta = (pct / 100.0) * base;
+            let res = if parts[1] == "+" { base + delta } else { base - delta };
+            let res_str = format_num(res);
+            return Some(NativeSearchResult {
+                file_name: format!("= {}", res_str),
+                file_path: res_str.clone(),
+                snippet: format!("Calculation: {} = {}", raw, res_str),
+                score: 1.0,
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: "calc".to_string(),
+                action: "copy".to_string(),
+                action_title: "Copy Result".to_string(),
+                icon: Some("calc".to_string()),
+            });
+        }
+    }
+
+    // 2. Hex / Binary conversions
+    let raw_lower_clean = clean.to_lowercase();
+    if raw_lower_clean.starts_with("0x") && raw_lower_clean.len() > 2 {
+        if let Ok(val) = u64::from_str_radix(&raw_lower_clean[2..], 16) {
+            let res_str = val.to_string();
+            return Some(NativeSearchResult {
+                file_name: format!("= {}", res_str),
+                file_path: res_str.clone(),
+                snippet: format!("Hex to Decimal: {} = {}", raw, res_str),
+                score: 1.0,
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: "calc".to_string(),
+                action: "copy".to_string(),
+                action_title: "Copy Decimal Value".to_string(),
+                icon: Some("calc".to_string()),
+            });
+        }
+    }
+
+    if raw_lower_clean.starts_with("0b") && raw_lower_clean.len() > 2 {
+        if let Ok(val) = u64::from_str_radix(&raw_lower_clean[2..], 2) {
+            let res_str = val.to_string();
+            return Some(NativeSearchResult {
+                file_name: format!("= {}", res_str),
+                file_path: res_str.clone(),
+                snippet: format!("Binary to Decimal: {} = {}", raw, res_str),
+                score: 1.0,
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: "calc".to_string(),
+                action: "copy".to_string(),
+                action_title: "Copy Decimal Value".to_string(),
+                icon: Some("calc".to_string()),
+            });
+        }
+    }
+
+    if raw_lower_clean.starts_with("hex ") {
+        let num_str = raw_lower_clean["hex ".len()..].trim();
+        if let Ok(val) = num_str.parse::<u64>() {
+            let hex_str = format!("0x{:X}", val);
+            return Some(NativeSearchResult {
+                file_name: format!("= {}", hex_str),
+                file_path: hex_str.clone(),
+                snippet: format!("Decimal to Hex: {} = {}", val, hex_str),
+                score: 1.0,
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: "calc".to_string(),
+                action: "copy".to_string(),
+                action_title: "Copy Hex Value".to_string(),
+                icon: Some("calc".to_string()),
+            });
+        }
+    }
+
+    if raw_lower_clean.starts_with("bin ") || raw_lower_clean.starts_with("binary ") {
+        let prefix_len = if raw_lower_clean.starts_with("bin ") { 4 } else { 7 };
+        let num_str = raw_lower_clean[prefix_len..].trim();
+        if let Ok(val) = num_str.parse::<u64>() {
+            let bin_str = format!("0b{:b}", val);
+            return Some(NativeSearchResult {
+                file_name: format!("= {}", bin_str),
+                file_path: bin_str.clone(),
+                snippet: format!("Decimal to Binary: {} = {}", val, bin_str),
+                score: 1.0,
+                file_ext: None,
+                file_size: None,
+                file_modified: None,
+                category: "calc".to_string(),
+                action: "copy".to_string(),
+                action_title: "Copy Binary Value".to_string(),
+                icon: Some("calc".to_string()),
+            });
+        }
+    }
+
+    // 3. Normal Math Expressions
+    let has_op = clean.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '^' | '%' | 'x' | 'X'));
+    let has_func = ["sqrt", "sin", "cos", "tan", "abs", "log", "ln", "round", "floor", "ceil", "cbrt", "pow"]
+        .iter()
+        .any(|&f| raw_lower_clean.contains(f));
+
+    if !has_op && !has_func {
+        return None;
+    }
+
+    if !clean.chars().any(|c| c.is_ascii_digit()) && !["pi", "e", "tau"].iter().any(|&c| raw_lower_clean.contains(c)) {
+        return None;
+    }
+
+    let tokens = tokenize_math(&clean)?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut parser = MathParser::new(tokens);
+    let val = parser.parse_expression()?;
+
+    if parser.pos == parser.tokens.len() && !val.is_nan() && !val.is_infinite() {
+        let res_str = format_num(val);
+        return Some(NativeSearchResult {
+            file_name: format!("= {}", res_str),
+            file_path: res_str.clone(),
+            snippet: format!("Calculation: {} = {}", raw, res_str),
+            score: 1.0,
+            file_ext: None,
+            file_size: None,
+            file_modified: None,
+            category: "calc".to_string(),
+            action: "copy".to_string(),
+            action_title: "Copy Result".to_string(),
+            icon: Some("calc".to_string()),
+        });
     }
 
     None
 }
 
 fn format_num(val: f64) -> String {
-    if val.fract() == 0.0 {
+    if val.fract() == 0.0 && val >= i64::MIN as f64 && val <= i64::MAX as f64 {
         format!("{:.0}", val)
     } else {
-        format!("{:.4}", val).trim_end_matches('0').trim_end_matches('.').to_string()
+        format!("{:.8}", val)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 
@@ -823,13 +1380,22 @@ pub fn scan_all_drives_background(shared_index: SharedMftIndex) {
             }
         }
 
-        // 1. Scan Installed Windows Applications
+        // 1. Scan Installed Windows Applications (parallel Rayon scan < 15ms)
         let apps = scan_windows_apps();
-        log::info!("Found {} Windows applications & system tools", apps.len());
+        log::info!("Found {} Windows applications & system tools in {:?}", apps.len(), start.elapsed());
 
         // 1b. Discover and cache Git Repositories in background
         let git_repos = crate::git::discover_and_cache_git_repos(&[]);
-        log::info!("Found {} Git repositories across workspace & dev directories", git_repos.len());
+        log::info!("Found {} Git repositories in {:?}", git_repos.len(), start.elapsed());
+
+        // 1c. PRE-CACHE: Publish apps & repos immediately so user can search apps instantly (< 20ms from launch)
+        {
+            if let Ok(mut idx) = shared_index.write() {
+                idx.apps = apps.clone();
+                idx.git_repos = git_repos.clone();
+                idx.status = "indexing_volumes".to_string();
+            }
+        }
 
         // 2. Scan All Storage Volumes (C:\, D:\, E:\, etc.)
         let mut volumes_data = Vec::new();
@@ -932,6 +1498,100 @@ mod tests {
 
         let res_div = evaluate_math("1024 / 8").unwrap();
         assert_eq!(res_div.file_name, "= 128");
+
+        let res_unspaced = evaluate_math("150*4").unwrap();
+        assert_eq!(res_unspaced.file_name, "= 600");
+
+        let res_precedence = evaluate_math("25 + 10 * 2").unwrap();
+        assert_eq!(res_precedence.file_name, "= 45");
+
+        let res_parens = evaluate_math("(10 + 20) * 3").unwrap();
+        assert_eq!(res_parens.file_name, "= 90");
+
+        let res_pct = evaluate_math("20% of 500").unwrap();
+        assert_eq!(res_pct.file_name, "= 100");
+
+        let res_pct_add = evaluate_math("500 + 20%").unwrap();
+        assert_eq!(res_pct_add.file_name, "= 600");
+
+        let res_hex = evaluate_math("0xff").unwrap();
+        assert_eq!(res_hex.file_name, "= 255");
+
+        let res_sqrt = evaluate_math("sqrt(144)").unwrap();
+        assert_eq!(res_sqrt.file_name, "= 12");
+
+        let res_calc_prefix = evaluate_math("calc 150 * 4").unwrap();
+        assert_eq!(res_calc_prefix.file_name, "= 600");
+
+        let res_equals_prefix = evaluate_math("= 25 + 10").unwrap();
+        assert_eq!(res_equals_prefix.file_name, "= 35");
+
+        let res_hesap_prefix = evaluate_math("hesap 100 / 5").unwrap();
+        assert_eq!(res_hesap_prefix.file_name, "= 20");
+
+        let res_equals_suffix = evaluate_math("50 * 2 =").unwrap();
+        assert_eq!(res_equals_suffix.file_name, "= 100");
+    }
+
+    #[test]
+    fn test_system_actions_evaluation() {
+        let lock_acts = evaluate_system_actions("lock");
+        assert!(!lock_acts.is_empty());
+        assert_eq!(lock_acts[0].action, "system_command");
+        assert_eq!(lock_acts[0].file_path, "lock");
+
+        let kilit_acts = evaluate_system_actions("kilit");
+        assert!(!kilit_acts.is_empty());
+        assert_eq!(kilit_acts[0].file_path, "lock");
+
+        let sleep_acts = evaluate_system_actions("sleep");
+        assert!(!sleep_acts.is_empty());
+        assert_eq!(sleep_acts[0].file_path, "sleep");
+
+        let uyku_acts = evaluate_system_actions("uyku");
+        assert!(!uyku_acts.is_empty());
+        assert_eq!(uyku_acts[0].file_path, "sleep");
+
+        let restart_acts = evaluate_system_actions("restart");
+        assert!(!restart_acts.is_empty());
+        assert_eq!(restart_acts[0].file_path, "restart");
+
+        let reboot_tr = evaluate_system_actions("yeniden başlat");
+        assert!(!reboot_tr.is_empty());
+        assert_eq!(reboot_tr[0].file_path, "restart");
+
+        let shutdown_acts = evaluate_system_actions("shutdown");
+        assert!(!shutdown_acts.is_empty());
+        assert_eq!(shutdown_acts[0].file_path, "shutdown");
+
+        let kapat_acts = evaluate_system_actions("kapat");
+        assert!(!kapat_acts.is_empty());
+        assert_eq!(kapat_acts[0].file_path, "shutdown");
+
+        let trash_acts = evaluate_system_actions("empty trash");
+        assert!(!trash_acts.is_empty());
+        assert_eq!(trash_acts[0].file_path, "empty_trash");
+
+        let cop_acts = evaluate_system_actions("çöpü boşalt");
+        assert!(!cop_acts.is_empty());
+        assert_eq!(cop_acts[0].file_path, "empty_trash");
+
+        let ip_acts = evaluate_system_actions("my ip");
+        assert!(!ip_acts.is_empty());
+        assert_eq!(ip_acts[0].action, "copy");
+
+        let ip_tr = evaluate_system_actions("ip adresi");
+        assert!(!ip_tr.is_empty());
+        assert_eq!(ip_tr[0].action, "copy");
+
+        let calc_acts = evaluate_system_actions("calc");
+        assert!(!calc_acts.is_empty());
+        assert_eq!(calc_acts[0].file_path, "calc");
+        assert_eq!(calc_acts[0].category, "app");
+
+        let hesap_acts = evaluate_system_actions("hesap makinesi");
+        assert!(!hesap_acts.is_empty());
+        assert_eq!(hesap_acts[0].file_path, "calc");
     }
 
     #[test]

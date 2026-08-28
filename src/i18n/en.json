@@ -111,7 +111,18 @@
     "ocr": "Read text in images (OCR)",
     "ocrDesc": "Also index text inside screenshots, photos and scanned PDFs. Loads a ~500 MB model and adds a couple of seconds per image.",
     "rebuildRequiredNote": "The embedding model changed. Rebuild the index so search uses the new one.",
-    "rebuildSuggestedNote": "Rebuild the index to pick up content that was skipped before."
+    "rebuildSuggestedNote": "Rebuild the index to pick up content that was skipped before.",
+    "updates": "Version & Updates",
+    "currentVersion": "Current Version",
+    "checkForUpdates": "Check for Updates",
+    "checkingUpdates": "Checking...",
+    "upToDate": "LocalMind is Up to Date",
+    "upToDateDesc": "You are running the latest release (v{{version}}).",
+    "updateAvailable": "New Version Available",
+    "updateAvailableDesc": "A new release is available (v{{version}}). Click to download.",
+    "downloadUpdate": "Download Update",
+    "viewReleaseNotes": "View Release Notes",
+    "updateCheckFailed": "Could not check for updates. Please check your network connection."
   },
   "index": {
     "progress": "Indexing: {{percent}}%",

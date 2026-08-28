@@ -19,6 +19,11 @@ import {
   AlertTriangle,
   SunMoon,
   HardDrive,
+  Sparkles,
+  Download,
+  CheckCircle2,
+  ExternalLink,
+  Github,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { ThemeToggle } from "./ThemeToggle";
@@ -26,6 +31,20 @@ import { ShortcutInput } from "./ShortcutInput";
 import { Toggle } from "./Toggle";
 import { getSidecarPort, subscribeSidecarPort } from "../lib/api";
 import type { EngineSettings, EngineSettingsState } from "../hooks/useEngineSettings";
+
+const CURRENT_VERSION = "2.1.0";
+
+interface GitHubRelease {
+  tag_name: string;
+  name: string;
+  body: string;
+  published_at: string;
+  html_url: string;
+  assets?: Array<{
+    name: string;
+    browser_download_url: string;
+  }>;
+}
 
 type SettingsTab = "general" | "indexing" | "performance";
 
@@ -131,6 +150,64 @@ export function SettingsPanel({
   const [libraryFolders, setLibraryFolders] = useState<string[]>([]);
   const [mftStatus, setMftStatus] = useState<MftStatusData | null>(null);
   const [rescanningDrives, setRescanningDrives] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "update-available" | "error">("idle");
+  const [latestRelease, setLatestRelease] = useState<GitHubRelease | null>(null);
+
+  const isNewerVersion = (remote: string, current: string): boolean => {
+    const rParts = remote.split(".").map((n) => parseInt(n) || 0);
+    const cParts = current.split(".").map((n) => parseInt(n) || 0);
+    for (let i = 0; i < Math.max(rParts.length, cParts.length); i++) {
+      const r = rParts[i] || 0;
+      const c = cParts[i] || 0;
+      if (r > c) return true;
+      if (r < c) return false;
+    }
+    return false;
+  };
+
+  const processRelease = (data: GitHubRelease) => {
+    setLatestRelease(data);
+    const cleanTag = data.tag_name.replace(/^v/i, "").trim();
+    if (isNewerVersion(cleanTag, CURRENT_VERSION)) {
+      setUpdateStatus("update-available");
+    } else {
+      setUpdateStatus("up-to-date");
+    }
+  };
+
+  const handleCheckForUpdates = async () => {
+    setUpdateStatus("checking");
+    try {
+      const res = await fetch("https://api.github.com/repos/sametgurtuna/localmind/releases/latest", {
+        signal: AbortSignal.timeout(6000),
+        headers: { Accept: "application/vnd.github.v3+json" },
+      });
+      if (!res.ok) {
+        const listRes = await fetch("https://api.github.com/repos/sametgurtuna/localmind/releases", {
+          signal: AbortSignal.timeout(6000),
+        });
+        if (listRes.ok) {
+          const releases: GitHubRelease[] = await listRes.json();
+          if (releases && releases.length > 0) {
+            processRelease(releases[0]);
+            return;
+          }
+        }
+        setUpdateStatus("error");
+        return;
+      }
+      const data: GitHubRelease = await res.json();
+      processRelease(data);
+    } catch {
+      setUpdateStatus("error");
+    }
+  };
+
+  const handleOpenUrl = (url: string) => {
+    invoke("open_file", { path: url }).catch(() => {
+      window.open(url, "_blank");
+    });
+  };
 
   const fetchMftStatus = () => {
     invoke<MftStatusData>("get_mft_status")
@@ -352,6 +429,107 @@ export function SettingsPanel({
                 label={t("settings.autostart")}
                 icon={<Monitor size={13} className="text-neutral-400" />}
               />
+            </section>
+
+            <div className="h-px bg-neutral-100 dark:bg-neutral-800" />
+
+            {/* Version & GitHub Updates */}
+            <section className="pt-0.5">
+              <SectionTitle icon={<Sparkles size={12} className="text-blue-500" />}>
+                {t("settings.updates", "Version & Updates")}
+              </SectionTitle>
+
+              <div className="p-3.5 rounded-xl bg-neutral-50 dark:bg-neutral-800/40 border border-neutral-200/80 dark:border-neutral-700/60 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">
+                      LocalMind
+                    </span>
+                    <span className="px-2 py-0.5 text-[10px] font-mono font-semibold rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+                      v{CURRENT_VERSION}
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={handleCheckForUpdates}
+                    disabled={updateStatus === "checking"}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:bg-neutral-800 dark:hover:bg-neutral-100 font-medium transition-colors cursor-pointer disabled:opacity-50 shadow-xs"
+                  >
+                    <RefreshCw size={12} className={clsx(updateStatus === "checking" && "animate-spin")} />
+                    <span>
+                      {updateStatus === "checking"
+                        ? t("settings.checkingUpdates", "Checking...")
+                        : t("settings.checkForUpdates", "Check for Updates")}
+                    </span>
+                  </button>
+                </div>
+
+                {updateStatus === "up-to-date" && (
+                  <div className="flex items-center gap-2 p-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-xs animate-fade-in">
+                    <CheckCircle2 size={15} className="shrink-0 text-emerald-500" />
+                    <span className="flex-1 font-medium">
+                      {t("settings.upToDateDesc", { version: CURRENT_VERSION, defaultValue: `You are running the latest release (v${CURRENT_VERSION}).` })}
+                    </span>
+                  </div>
+                )}
+
+                {updateStatus === "update-available" && latestRelease && (
+                  <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/25 space-y-2.5 animate-slide-fade-in">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Sparkles size={15} className="text-blue-500 shrink-0" />
+                        <span className="text-xs font-semibold text-blue-900 dark:text-blue-200">
+                          {t("settings.updateAvailable", "New Version Available")}: {latestRelease.tag_name}
+                        </span>
+                      </div>
+                      {latestRelease.published_at && (
+                        <span className="text-[10px] text-neutral-500 dark:text-neutral-400">
+                          {new Date(latestRelease.published_at).toLocaleDateString()}
+                        </span>
+                      )}
+                    </div>
+
+                    {latestRelease.name && (
+                      <p className="text-[11px] font-medium text-neutral-700 dark:text-neutral-300">
+                        {latestRelease.name}
+                      </p>
+                    )}
+
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        onClick={() => handleOpenUrl(latestRelease.html_url)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium shadow-xs transition-colors cursor-pointer"
+                      >
+                        <Download size={12} />
+                        <span>{t("settings.downloadUpdate", "Download Update")}</span>
+                      </button>
+                      <button
+                        onClick={() => handleOpenUrl(latestRelease.html_url)}
+                        className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg border border-neutral-200 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors cursor-pointer"
+                      >
+                        <ExternalLink size={12} />
+                        <span>{t("settings.viewReleaseNotes", "Release Notes")}</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {updateStatus === "error" && (
+                  <div className="flex items-center justify-between gap-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-800 dark:text-amber-300 text-xs animate-fade-in">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle size={14} className="shrink-0 text-amber-500" />
+                      <span>{t("settings.updateCheckFailed", "Could not check for updates.")}</span>
+                    </div>
+                    <button
+                      onClick={() => handleOpenUrl("https://github.com/sametgurtuna/localmind/releases")}
+                      className="flex items-center gap-1 underline text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:opacity-80 cursor-pointer"
+                    >
+                      <Github size={11} />
+                      <span>Releases</span>
+                    </button>
+                  </div>
+                )}
+              </div>
             </section>
           </>
         )}
